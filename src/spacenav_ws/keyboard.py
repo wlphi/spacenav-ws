@@ -80,6 +80,13 @@ SHORTCUTS: dict[str, str] = {
     "TEXT_RECTANGLE_TWO_CORNERS": "shift+t",   # "Text"
     "USE":                      "u",           # "Use / project" (Onshape default: U)
     "FILLET":                   "shift+f",     # Sketch fillet (Onshape default: Shift+F)
+    # Confirmed Onshape shortcuts for tools with no single-letter default
+    "RECTANGLE_ALIGNED":        "shift+alt+r", # Aligned rectangle
+    "SLOT":                     "j",           # Slot
+    "SKETCHMIRROR":             "alt+i",       # Mirror
+    "SKETCHCPATTERN":           "alt+g",       # Circular pattern
+    "SPLINE":                   "alt+v",       # Spline
+    "ELLIPSE":                  "shift+b",     # Ellipse
 
     # ── Assembly ─────────────────────────────────────────────────────────
     "insertPart":       "i",
