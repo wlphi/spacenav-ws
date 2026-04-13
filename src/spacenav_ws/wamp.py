@@ -180,17 +180,23 @@ class WampSession:
             # They're all like.. interleaved.. have to create one task per message with the current approach.. Not very nice because it means errors don't bubble up
             asyncio.create_task(self.wamp.run_message_handler(msg))
 
-    async def client_rpc(self, controller_uri: str, method: str, *args):
+    async def client_rpc(self, controller_uri: str, method: str, *args, timeout: float | None = None):
         """This function lives for the duration of the rpc. It registers the inflight request and waits for either handle_callresult or handle_callerror to finalize the rpc.."""
         call = Call.create(method, "", *args)
         # Launch RPC in background as task. I guess? This is pretty unclear to me? Why are the calls wrapped in Events? Because of the Subscription?
         await self.wamp.send_message(Event(controller_uri, call.serialize_with_msg_id()))
 
         rpc = {"gate": asyncio.Event(), "result": None, "error": None}
-
         self.in_flight_rpcs[call.call_id] = rpc
-        await rpc["gate"].wait()
-        del self.in_flight_rpcs[call.call_id]
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(rpc["gate"].wait(), timeout=timeout)
+            else:
+                await rpc["gate"].wait()
+        except asyncio.TimeoutError:
+            raise
+        finally:
+            self.in_flight_rpcs.pop(call.call_id, None)
 
         if rpc["error"] is not None:
             logging.error('Encountered error "%s" during %s', rpc["error"], call)

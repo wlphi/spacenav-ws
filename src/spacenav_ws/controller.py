@@ -124,6 +124,12 @@ class Controller:
         self.focus = True
 
     async def client_update(self, controller_id: str, args: dict[str, Any]):
+        # Log unknown keys so we can discover undocumented properties
+        known_keys = {"focus", "images", "commands"}
+        extra = {k: args[k] for k in args if k not in known_keys}
+        if extra:
+            logging.info("3dx#update extra keys: %s", list(extra.keys()))
+
         if (focus := args.get("focus")) is not None:
             self.focus = focus
 
@@ -144,6 +150,9 @@ class Controller:
         if (cmds := args.get("commands")) is not None:
             active_set = cmds.get("activeSet", "")
             tree = cmds.get("tree")
+            if tree and not self._context_commands:
+                # Log the raw tree once so we can inspect real command IDs
+                logging.warning("commands tree (first receive): %s", json.dumps(tree)[:3000])
 
             if tree:
                 # Tree contains all contexts at once; group commands per top-level category
@@ -526,12 +535,46 @@ class Controller:
         self.display.show_hotkeys(self.hotkeys)
 
     async def _invoke_onshape_command(self, command_id: str):
-        """Ask Onshape to execute a command by ID (e.g. 'extrude', 'LINESEGMENT')."""
-        logging.info("Invoking Onshape command: %s", command_id)
-        try:
-            await self.remote_write("command", command_id)
-        except Exception as exc:
-            logging.warning("command %r failed: %s", command_id, exc)
+        """Ask Onshape to execute a command by ID (e.g. 'Part Studio-extrude').
+
+        Tries several WAMP property names in sequence; if all are rejected by
+        Onshape, falls back to injecting the corresponding keyboard shortcut
+        via uinput (Wayland-compatible).
+        """
+        logging.info("Invoking Onshape command: %r", command_id)
+        leaf_id = command_id.split("-", 1)[-1] if "-" in command_id else command_id
+
+        # WAMP probe: try candidate property names with a 1.5 s timeout so we
+        # don't hang if Onshape silently ignores an unknown method.
+        wamp_candidates = [
+            ("activeCommand", command_id),
+            ("activeCommand", leaf_id),
+            ("command",       leaf_id),   # original attempt, but with leaf only
+        ]
+        for prop, value in wamp_candidates:
+            try:
+                await self.wamp_state_handler.client_rpc(
+                    self.controller_uri, "self:update", prop, value,
+                    timeout=1.5,
+                )
+                logging.info("Command invoked via self:update/%s=%r", prop, value)
+                return
+            except asyncio.TimeoutError:
+                logging.warning("WAMP self:update/%s=%r → timeout", prop, value)
+                break   # no point retrying further if Onshape didn't respond at all
+            except ValueError as exc:
+                logging.warning("WAMP self:update/%s=%r → %s", prop, value, exc)
+
+        # Keyboard fallback
+        from spacenav_ws.keyboard import inject_shortcut
+        if inject_shortcut(command_id):
+            return
+        logging.warning(
+            "No working invocation for command %r.\n"
+            "  Add a keyboard shortcut to ~/.config/spacenav-ws/shortcuts.json:\n"
+            '    {"%s": "shift+x"}',
+            command_id, command_id,
+        )
 
     async def _signal_motion(self):
         await self.remote_write("motion", True)
