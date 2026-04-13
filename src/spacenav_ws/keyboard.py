@@ -45,8 +45,12 @@ SHORTCUTS: dict[str, str] = {
     "shell":            "shift+h",    # user-assigned example
     "mirror":           "shift+m",    # user-assigned example
     "pattern":          "shift+p",    # user-assigned example
-    # sweep, loft, thicken, enclose, faceBlend, bodyDraft have no defaults
-    # — add entries in ~/.config/spacenav-ws/shortcuts.json after assigning in Onshape
+    "sweep":            "shift+a",    # user-assigned
+    "loft":             "shift+k",    # user-assigned
+    "thicken":          "shift+o",    # user-assigned
+    "enclose":          "shift+u",    # user-assigned
+    "faceBlend":        "shift+j",    # user-assigned
+    "bodyDraft":        "shift+g",    # user-assigned
 
     # ── Sketch (real IDs captured from Onshape command tree) ─────────────
     "LINESEGMENT":              "l",
@@ -82,8 +86,10 @@ SHORTCUTS: dict[str, str] = {
     "FILLET":                   "shift+f",     # Sketch fillet (Onshape default: Shift+F)
     # Confirmed Onshape shortcuts for tools with no single-letter default
     "RECTANGLE_ALIGNED":        "shift+alt+r", # Aligned rectangle
+    "CIRCLE_PERIMETER":         "alt+k",       # 3-point circle
     "SLOT":                     "j",           # Slot
     "SKETCHMIRROR":             "alt+i",       # Mirror
+    "SKETCHLPATTERN":           "alt+q",       # Linear pattern
     "SKETCHCPATTERN":           "alt+g",       # Circular pattern
     "SPLINE":                   "alt+v",       # Spline
     "ELLIPSE":                  "shift+b",     # Ellipse
