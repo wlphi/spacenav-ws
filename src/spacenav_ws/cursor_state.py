@@ -14,3 +14,8 @@ from __future__ import annotations
 
 # Mutable list so callers can update in-place without rebinding names.
 ndc: list[float] = [0.0, 0.0]   # [nx, ny]
+
+# Set to True once the /cursor WebSocket has delivered at least one position.
+# Until then, _cursor_pivot falls back to model-bbox centre so that the
+# rotation feels the same as before the feature was added.
+active: bool = False

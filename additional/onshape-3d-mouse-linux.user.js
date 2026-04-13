@@ -36,20 +36,33 @@ console.log('[Onshape patch] navigator.platform →', navigator.platform);
         }
     }
 
-    function getViewportRect() {
-        // Prefer the main WebGL canvas so toolbar area is excluded.
-        // Onshape renders into a <canvas> that usually covers the right-hand
-        // portion of the window; fall back to full window if not found.
-        const canvas = document.querySelector('canvas');
-        if (canvas) {
-            const r = canvas.getBoundingClientRect();
-            if (r.width > 200 && r.height > 200) return r;
-        }
-        return { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+    // Cache the detected viewport canvas to avoid repeated DOM queries.
+    let _vpCanvas = null;
+    let _vpCanvasChecked = 0;
+
+    function getViewportCanvas() {
+        const now = Date.now();
+        if (_vpCanvas && now - _vpCanvasChecked < 2000) return _vpCanvas;
+        _vpCanvasChecked = now;
+
+        // Onshape places a full-window canvas for the 3-D scene but overlays
+        // toolbar / panel divs on top.  document.elementsFromPoint lets us
+        // look through the stacking order and find any canvas at the centre of
+        // the window, which is reliably inside the 3-D viewport.
+        const cx = Math.round(window.innerWidth  * 0.6);  // right of centre → clear of left panel
+        const cy = Math.round(window.innerHeight * 0.5);
+        const hits = document.elementsFromPoint(cx, cy);
+        _vpCanvas = hits.find(el => el.tagName === 'CANVAS' && el.width > 400) || null;
+        return _vpCanvas;
     }
 
     function onMouseMove(e) {
-        const r = getViewportRect();
+        const canvas = getViewportCanvas();
+        if (!canvas) return;
+
+        const r = canvas.getBoundingClientRect();
+        if (r.width < 100 || r.height < 100) return;
+
         // Map pixel position to NDC [-1, 1]; Y is flipped (screen Y grows down).
         lastNx = ((e.clientX - r.left) / r.width)  * 2 - 1;
         lastNy = 1 - ((e.clientY - r.top)  / r.height) * 2;

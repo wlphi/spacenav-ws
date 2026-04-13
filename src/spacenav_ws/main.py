@@ -84,6 +84,7 @@ async def event_stream():
 async def cursor_endpoint(ws: WebSocket):
     """Receives mouse cursor NDC coords from the userscript for pivot computation."""
     await ws.accept()
+    cursor_state.active = True
     try:
         while True:
             data = await ws.receive_json()
@@ -91,6 +92,8 @@ async def cursor_endpoint(ws: WebSocket):
             cursor_state.ndc[1] = float(data.get("y", 0.0))
     except Exception:
         pass
+    finally:
+        cursor_state.active = False
 
 
 @app.websocket("/")

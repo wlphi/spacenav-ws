@@ -111,6 +111,13 @@ class Controller:
         self._cached_extents: list | None = None
         self._cache_time: float = 0.0
 
+        # Pivot lock: world-space pivot is computed once at gesture start and held
+        # for the entire gesture (so the model orbits a fixed point even as the
+        # view matrix changes frame-to-frame).
+        self._locked_pivot: np.ndarray | None = None
+        self._last_motion_time: float = 0.0
+        self._GESTURE_GAP_S: float = 0.15   # seconds of silence = new gesture
+
         # Context-aware commands sent by Onshape via client_update
         self._active_set: str = ""
         self._context_commands: dict[str, list[dict]] = {}  # activeSet -> [{id, label}, ...]
@@ -683,9 +690,24 @@ class Controller:
 
         # Apply rotation around pivot first, then add camera-relative translation.
         # Pan input is in camera space; multiply by R_cam to convert to world space so
-        # panning follows the screen axes regardless of camera orientation.
-        nx, ny = cursor_state.ndc
-        pivot = self._cursor_pivot(nx, ny, model_extents, curr_affine, extents)
+        # Pivot: computed once at gesture start, then locked in world space for the
+        # entire gesture so the model orbits a fixed point even as the view changes.
+        now = time.monotonic()
+        new_gesture = (now - self._last_motion_time) > self._GESTURE_GAP_S
+        self._last_motion_time = now
+
+        if new_gesture or self._locked_pivot is None:
+            if cursor_state.active:
+                nx, ny = cursor_state.ndc
+                self._locked_pivot = self._cursor_pivot(nx, ny, model_extents, curr_affine, extents)
+            else:
+                min_pt = np.array(model_extents[:3], dtype=np.float32)
+                max_pt = np.array(model_extents[3:6], dtype=np.float32)
+                self._locked_pivot = (min_pt + max_pt) * 0.5
+            logging.warning("pivot lock: active=%s ndc=(%.2f,%.2f) p=[%.3f,%.3f,%.3f]",
+                            cursor_state.active, *cursor_state.ndc, *self._locked_pivot)
+
+        pivot = self._locked_pivot
         pivot_pos, pivot_neg = self._get_affine_pivot_matrices(pivot)
         new_affine = curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
 
@@ -709,12 +731,14 @@ class Controller:
                       model_extents: list,
                       curr_affine: np.ndarray,
                       extents: list | None) -> np.ndarray:
-        """Project the screen-space cursor onto the model AABB to get a pivot.
+        """Project the screen-space cursor to model-centre depth to get a pivot.
 
-        Uses a ray–AABB intersection (slab method) in world space.
-        Falls back to the model bounding-box centre when:
-          - extents are unavailable, or
-          - the cursor ray misses the model entirely.
+        This places the rotation pivot at the world-space point directly under
+        the cursor at the same depth as the model bounding-box centre.  No
+        ray–AABB intersection is needed: the approach works regardless of
+        whether the cursor is over the model silhouette.
+
+        Falls back to the model bounding-box centre when extents are absent.
         """
         min_pt = np.array(model_extents[:3], dtype=np.float64)
         max_pt = np.array(model_extents[3:], dtype=np.float64)
@@ -724,61 +748,37 @@ class Controller:
             return model_center
 
         A = curr_affine.astype(np.float64)
-        R     = A[:3, :3]      # world→camera rotation
-        R_cam = R.T            # camera→world rotation
-        t     = A[3, :3]      # view translation (world origin shifted by this)
+        R     = A[:3, :3]   # world→camera rotation  (row vectors are camera axes)
+        R_cam = R.T         # camera→world rotation
+        t     = A[3, :3]   # view translation
 
-        # Camera-space half-extents (extents assumed symmetric around 0)
-        # General formula handles panned/asymmetric cases too.
+        # Camera-space half-extents (handles asymmetric / panned views).
         cx_center = (extents[0] + extents[3]) * 0.5
         cy_center = (extents[1] + extents[4]) * 0.5
         cx_half   = (extents[3] - extents[0]) * 0.5
         cy_half   = (extents[4] - extents[1]) * 0.5
 
-        # Model centre in camera space — gives us the depth reference for the ray.
+        # Model centre in camera space.
         mc_cam = model_center @ R + t
 
-        # Camera-space point on the cursor ray at the model-centre depth.
+        # Cursor position in camera space at model-centre depth.
         cursor_cam = np.array([
             cx_center + nx * cx_half,
             cy_center + ny * cy_half,
             mc_cam[2],
         ])
 
-        # Transform to world space → ray origin (a point on the cursor ray).
-        ray_origin = (cursor_cam - t) @ R_cam
-
-        # Look direction in world space (camera -Z).
-        ray_dir = -R_cam[:, 2]
-        norm = np.linalg.norm(ray_dir)
-        if norm < 1e-9:
+        # Guard: if the cursor is more than 2× the viewport half-width away from
+        # the model centre in camera space, it is almost certainly in a toolbar or
+        # side-panel rather than the 3-D viewport.  Fall back to model centre.
+        cursor_dist = np.sqrt((cursor_cam[0] - mc_cam[0])**2 +
+                              (cursor_cam[1] - mc_cam[1])**2)
+        viewport_half = max(cx_half, cy_half)
+        if cursor_dist > viewport_half * 2.0:
             return model_center
-        ray_dir /= norm
 
-        # Ray–AABB slab intersection.
-        t_min, t_max = -np.inf, np.inf
-        for i in range(3):
-            if abs(ray_dir[i]) < 1e-10:
-                if ray_origin[i] < min_pt[i] or ray_origin[i] > max_pt[i]:
-                    return model_center   # miss — axis-aligned slab excludes ray
-            else:
-                t1 = (min_pt[i] - ray_origin[i]) / ray_dir[i]
-                t2 = (max_pt[i] - ray_origin[i]) / ray_dir[i]
-                t_min = max(t_min, min(t1, t2))
-                t_max = min(t_max, max(t1, t2))
-
-        if t_min > t_max:
-            return model_center   # ray missed the box
-
-        # Choose the appropriate hit parameter:
-        #  t_min < 0 < t_max  → ray_origin is INSIDE the box (use it directly)
-        #  0 ≤ t_min           → hit the near face (use t_min)
-        if t_min >= 0:
-            return ray_origin + t_min * ray_dir
-        if t_max >= 0:
-            return ray_origin   # inside AABB — origin is already a good pivot
-        # Box is behind the camera — fall back
-        return model_center
+        # Transform back to world space: p_world = (p_cam - t) @ R^{-1}
+        return (cursor_cam - t) @ R_cam
 
     @staticmethod
     def _get_affine_pivot_matrices(pivot: np.ndarray):
