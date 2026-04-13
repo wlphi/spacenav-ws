@@ -13,6 +13,7 @@ from rich.logging import RichHandler
 from spacenav_ws.controller import create_mouse_controller
 from spacenav_ws.spacenav import from_message, get_async_spacenav_socket_reader
 from spacenav_ws.wamp import WampSession
+import spacenav_ws.cursor_state as cursor_state
 
 # TODO: This handler isn't used for the uvicorn logs and I can't be bothered finding the magic logging incantations to make it so.
 logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
@@ -77,6 +78,19 @@ async def get_mouse_event_generator():
 async def event_stream():
     """Stream mouse motion data"""
     return StreamingResponse(get_mouse_event_generator(), media_type="text/event-stream")
+
+
+@app.websocket("/cursor")
+async def cursor_endpoint(ws: WebSocket):
+    """Receives mouse cursor NDC coords from the userscript for pivot computation."""
+    await ws.accept()
+    try:
+        while True:
+            data = await ws.receive_json()
+            cursor_state.ndc[0] = float(data.get("x", 0.0))
+            cursor_state.ndc[1] = float(data.get("y", 0.0))
+    except Exception:
+        pass
 
 
 @app.websocket("/")

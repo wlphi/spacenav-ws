@@ -24,6 +24,7 @@ from spacenav_ws.buttons import (
     get_button_map, get_shift_map, get_hotkeys, SHIFT_BUTTON_ID
 )
 from spacenav_ws.display import EnterpriseDisplay
+import spacenav_ws.cursor_state as cursor_state
 
 # Single display instance shared across all connections — USB interface is
 # claimed once at startup and kept open for the lifetime of the process.
@@ -680,10 +681,12 @@ class Controller:
         rot_delta = np.eye(4, dtype=np.float32)
         rot_delta[:3, :3] = R_world
 
-        # Apply rotation around model pivot first, then add camera-relative translation.
+        # Apply rotation around pivot first, then add camera-relative translation.
         # Pan input is in camera space; multiply by R_cam to convert to world space so
         # panning follows the screen axes regardless of camera orientation.
-        pivot_pos, pivot_neg = self._get_affine_pivot_matrices(model_extents)
+        nx, ny = cursor_state.ndc
+        pivot = self._cursor_pivot(nx, ny, model_extents, curr_affine, extents)
+        pivot_pos, pivot_neg = self._get_affine_pivot_matrices(pivot)
         new_affine = curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
 
         extent_scale = sum(extents[3:6]) / 3.0 if extents else 1.0
@@ -702,14 +705,87 @@ class Controller:
         await asyncio.gather(*writes)
 
     @staticmethod
-    def _get_affine_pivot_matrices(model_extents):
-        min_pt = np.array(model_extents[0:3], dtype=np.float32)
-        max_pt = np.array(model_extents[3:6], dtype=np.float32)
-        pivot = (min_pt + max_pt) * 0.5
+    def _cursor_pivot(nx: float, ny: float,
+                      model_extents: list,
+                      curr_affine: np.ndarray,
+                      extents: list | None) -> np.ndarray:
+        """Project the screen-space cursor onto the model AABB to get a pivot.
+
+        Uses a ray–AABB intersection (slab method) in world space.
+        Falls back to the model bounding-box centre when:
+          - extents are unavailable, or
+          - the cursor ray misses the model entirely.
+        """
+        min_pt = np.array(model_extents[:3], dtype=np.float64)
+        max_pt = np.array(model_extents[3:], dtype=np.float64)
+        model_center = (min_pt + max_pt) * 0.5
+
+        if extents is None or len(extents) < 6:
+            return model_center
+
+        A = curr_affine.astype(np.float64)
+        R     = A[:3, :3]      # world→camera rotation
+        R_cam = R.T            # camera→world rotation
+        t     = A[3, :3]      # view translation (world origin shifted by this)
+
+        # Camera-space half-extents (extents assumed symmetric around 0)
+        # General formula handles panned/asymmetric cases too.
+        cx_center = (extents[0] + extents[3]) * 0.5
+        cy_center = (extents[1] + extents[4]) * 0.5
+        cx_half   = (extents[3] - extents[0]) * 0.5
+        cy_half   = (extents[4] - extents[1]) * 0.5
+
+        # Model centre in camera space — gives us the depth reference for the ray.
+        mc_cam = model_center @ R + t
+
+        # Camera-space point on the cursor ray at the model-centre depth.
+        cursor_cam = np.array([
+            cx_center + nx * cx_half,
+            cy_center + ny * cy_half,
+            mc_cam[2],
+        ])
+
+        # Transform to world space → ray origin (a point on the cursor ray).
+        ray_origin = (cursor_cam - t) @ R_cam
+
+        # Look direction in world space (camera -Z).
+        ray_dir = -R_cam[:, 2]
+        norm = np.linalg.norm(ray_dir)
+        if norm < 1e-9:
+            return model_center
+        ray_dir /= norm
+
+        # Ray–AABB slab intersection.
+        t_min, t_max = -np.inf, np.inf
+        for i in range(3):
+            if abs(ray_dir[i]) < 1e-10:
+                if ray_origin[i] < min_pt[i] or ray_origin[i] > max_pt[i]:
+                    return model_center   # miss — axis-aligned slab excludes ray
+            else:
+                t1 = (min_pt[i] - ray_origin[i]) / ray_dir[i]
+                t2 = (max_pt[i] - ray_origin[i]) / ray_dir[i]
+                t_min = max(t_min, min(t1, t2))
+                t_max = min(t_max, max(t1, t2))
+
+        if t_min > t_max:
+            return model_center   # ray missed the box
+
+        # Choose the appropriate hit parameter:
+        #  t_min < 0 < t_max  → ray_origin is INSIDE the box (use it directly)
+        #  0 ≤ t_min           → hit the near face (use t_min)
+        if t_min >= 0:
+            return ray_origin + t_min * ray_dir
+        if t_max >= 0:
+            return ray_origin   # inside AABB — origin is already a good pivot
+        # Box is behind the camera — fall back
+        return model_center
+
+    @staticmethod
+    def _get_affine_pivot_matrices(pivot: np.ndarray):
         pivot_pos = np.eye(4, dtype=np.float32)
-        pivot_pos[3, :3] = pivot
+        pivot_pos[3, :3] = pivot.astype(np.float32)
         pivot_neg = np.eye(4, dtype=np.float32)
-        pivot_neg[3, :3] = -pivot
+        pivot_neg[3, :3] = -pivot.astype(np.float32)
         return pivot_pos, pivot_neg
 
 
