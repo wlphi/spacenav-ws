@@ -54,9 +54,9 @@ SHORTCUTS: dict[str, str] = {
     # Circles — "C" = Center point circle; 3-point perimeter circle has no default
     "CIRCLE_CENTER_RADIUS":     "c",    # "Center point circle"
     "CIRCLE":                   "c",    # generic fallback
-    # Rectangles — "R" = Center point rectangle; corner/aligned have no defaults
-    "RECTANGLE_CENTER":         "r",    # "Center point rectangle"
-    "RECTANGLE_TWO_CORNERS":    "r",    # "Corner rectangle" — no default, use R as fallback
+    # Rectangles
+    "RECTANGLE_CENTER":         "r",    # "Center point rectangle"  (Onshape default: R)
+    "RECTANGLE_TWO_CORNERS":    "g",    # "Corner rectangle"        (Onshape default: G)
     # Arcs
     "ARC_START_END_RADIUS":     "a",    # "3 point arc"
     "ARC_TANGENT":              "a",    # "Tangent arc" — no default, use A as fallback
@@ -78,7 +78,8 @@ SHORTCUTS: dict[str, str] = {
     "PERPENDICULAR":            "shift+l",
     "MIDPOINT":                 "shift+m",
     "TEXT_RECTANGLE_TWO_CORNERS": "shift+t",   # "Text"
-    "USE":                      "u",           # "Use" — no standard doc shortcut
+    "USE":                      "u",           # "Use / project" (Onshape default: U)
+    "FILLET":                   "shift+f",     # Sketch fillet (Onshape default: Shift+F)
 
     # ── Assembly ─────────────────────────────────────────────────────────
     "insertPart":       "i",
