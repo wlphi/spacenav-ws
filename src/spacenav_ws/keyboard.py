@@ -194,8 +194,12 @@ def _send_keys(shortcut: str, label: str = "") -> bool:
             keys.append(kc)
 
     if not keys:
-        logging.warning("keyboard: no main key in shortcut %r", shortcut)
-        return False
+        # Standalone modifier (e.g. "alt", "ctrl") — press and release it alone
+        if mods:
+            keys, mods = mods, []
+        else:
+            logging.warning("keyboard: no main key in shortcut %r", shortcut)
+            return False
 
     try:
         for mod in mods:

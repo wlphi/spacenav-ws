@@ -97,6 +97,7 @@ class Controller:
         self.focus = False
         self.lock_rotation = False
         self.shift_held = False
+        self._auto_lock_active: bool = False  # True when lock was applied automatically by context
 
         self.button_map: dict[int, str] = get_button_map()
         self.shift_map: dict[int, str] = get_shift_map()
@@ -163,8 +164,10 @@ class Controller:
                         self._context_commands[cat_id] = flat
 
             if active_set != self._active_set:
-                logging.info("Context: %s → %s", self._active_set, active_set)
+                old_set = self._active_set
+                logging.info("Context: %s → %s", old_set, active_set)
                 self._active_set = active_set
+                self._handle_context_lock(old_set, active_set)
 
             # Update display only when context commands actually change
             display_cmds = self._context_commands.get(active_set, [])
@@ -309,11 +312,12 @@ class Controller:
 
         elif action == "toggle_lock_rotation":
             self.lock_rotation = not self.lock_rotation
+            self._auto_lock_active = False   # user took manual control
             msg = "LOCK ON" if self.lock_rotation else "LOCK OFF"
             logging.info(msg)
             self.display.show_message(msg)
             await asyncio.sleep(1.2)
-            self.display.show_hotkeys(self.hotkeys)
+            self._restore_context_display()
 
         elif action == "toggle_perspective":
             current = await self.remote_read("view.perspective")
@@ -580,19 +584,57 @@ class Controller:
         await self.remote_write("motion", True)
         await self.remote_write("motion", False)
 
+    # ------------------------------------------------------------------ #
+    #  Context-lock helpers                                               #
+    # ------------------------------------------------------------------ #
+
+    _2D_CONTEXTS = {"Sketch", "Drawing"}
+
+    def _handle_context_lock(self, old_set: str, new_set: str) -> None:
+        """Auto-enable/disable rotation lock when entering/leaving 2D contexts."""
+        if new_set in self._2D_CONTEXTS and not self._auto_lock_active:
+            self.lock_rotation = True
+            self._auto_lock_active = True
+            logging.info("Auto-lock ON  (%s)", new_set)
+            asyncio.create_task(self._context_notification(new_set))
+        elif new_set not in self._2D_CONTEXTS and self._auto_lock_active:
+            self.lock_rotation = False
+            self._auto_lock_active = False
+            logging.info("Auto-lock OFF (%s → %s)", old_set, new_set)
+
+    async def _context_notification(self, context: str) -> None:
+        """Briefly show a context banner, then restore the hotkey grid."""
+        labels = {"Sketch": "SKETCH LOCK", "Drawing": "2D MODE"}
+        msg = labels.get(context, f"{context.upper()} MODE")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.display.show_message, msg)
+        await asyncio.sleep(0.8)
+        self._restore_context_display()
+
+    def _restore_context_display(self) -> None:
+        """(Re-)draw the hotkey grid for the current context."""
+        display_cmds = self._context_commands.get(self._active_set, [])
+        hotkeys = self._commands_to_hotkeys(display_cmds[:12]) if display_cmds else self.hotkeys
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self.display.show_hotkeys, hotkeys)
+
+    # ------------------------------------------------------------------ #
+    #  Key injection (uinput primary, xdotool fallback for X11)           #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
-    def _inject_key(key_name: str):
-        key_map = {
-            "esc":    "Escape",
-            "enter":  "Return",
-            "delete": "Delete",
-            "tab":    "Tab",
-            "space":  "space",
-            "alt":    "alt",
-            "shift":  "shift",
-            "ctrl":   "ctrl",
+    def _inject_key(key_name: str) -> None:
+        """Inject a single key press.  Uses uinput (Wayland-compatible) first."""
+        from spacenav_ws.keyboard import _send_keys
+        if _send_keys(key_name):
+            return
+        # xdotool fallback (X11 only)
+        xkey_map = {
+            "esc": "Escape", "enter": "Return", "delete": "Delete",
+            "tab": "Tab", "space": "space",
+            "alt": "alt", "shift": "shift", "ctrl": "ctrl",
         }
-        xkey = key_map.get(key_name, key_name)
+        xkey = xkey_map.get(key_name, key_name)
         env = {**os.environ, **_X11_ENV}
         try:
             result = subprocess.run(
