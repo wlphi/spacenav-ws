@@ -25,6 +25,10 @@ from spacenav_ws.buttons import (
 )
 from spacenav_ws.display import EnterpriseDisplay
 
+# Single display instance shared across all connections — USB interface is
+# claimed once at startup and kept open for the lifetime of the process.
+_display = EnterpriseDisplay()
+
 # Saved custom views are persisted here so they survive restarts
 _SAVED_VIEWS_PATH = Path.home() / ".config" / "spacenav-ws" / "saved_views.json"
 
@@ -105,7 +109,13 @@ class Controller:
         self._cached_extents: list | None = None
         self._cache_time: float = 0.0
 
-        self.display = EnterpriseDisplay()
+        # Context-aware commands sent by Onshape via client_update
+        self._active_set: str = ""
+        self._context_commands: dict[str, list[dict]] = {}  # activeSet -> [{id, label}, ...]
+        self._svg_cache: dict[str, bytes] = {}              # command id -> raw SVG bytes
+        self._last_display_key: tuple = ()                  # debounce display updates
+
+        self.display = _display
         self.display.show_hotkeys(self.hotkeys)
 
     async def subscribe(self, msg: Subscribe):
@@ -114,9 +124,57 @@ class Controller:
         self.focus = True
 
     async def client_update(self, controller_id: str, args: dict[str, Any]):
-        logging.debug("Got update for '%s': %s", controller_id, args)
         if (focus := args.get("focus")) is not None:
             self.focus = focus
+
+        if (imgs := args.get("images")) is not None:
+            import base64
+            updated_ids = set()
+            for entry in imgs:
+                cmd_id = entry.get("id", "")
+                raw = entry.get("data", "")
+                if cmd_id and raw:
+                    self._svg_cache[cmd_id] = base64.b64decode(raw.replace(" ", ""))
+                    updated_ids.add(cmd_id)
+            # If any updated icon belongs to the currently displayed commands, refresh
+            display_cmds = self._context_commands.get(self._active_set, [])
+            if updated_ids & {c["id"] for c in display_cmds[:12]}:
+                self._last_display_key = ()  # force redraw
+
+        if (cmds := args.get("commands")) is not None:
+            active_set = cmds.get("activeSet", "")
+            tree = cmds.get("tree")
+
+            if tree:
+                # Tree contains all contexts at once; group commands per top-level category
+                for cat_node in tree.get("nodes", []):
+                    cat_id = cat_node.get("id", "")
+                    flat = self._flatten_commands(cat_node)
+                    if flat:
+                        self._context_commands[cat_id] = flat
+
+            if active_set != self._active_set:
+                logging.info("Context: %s → %s", self._active_set, active_set)
+                self._active_set = active_set
+
+            # Update display only when context commands actually change
+            display_cmds = self._context_commands.get(active_set, [])
+            display_key = (active_set, tuple(c["id"] for c in display_cmds[:12]))
+            logging.info("display update check: active=%r cmds=%d key_changed=%s",
+                         active_set, len(display_cmds), display_key != self._last_display_key)
+            if display_key != self._last_display_key:
+                self._last_display_key = display_key
+                loop = asyncio.get_event_loop()
+                if display_cmds:
+                    hotkeys = self._commands_to_hotkeys(display_cmds[:12])
+                    def _do_show(hk=hotkeys):
+                        try:
+                            self.display.show_hotkeys(hk)
+                        except Exception as exc:
+                            logging.warning("show_hotkeys failed: %s", exc)
+                    loop.run_in_executor(None, _do_show)
+                else:
+                    loop.run_in_executor(None, self.display.show_hotkeys, self.hotkeys)
 
     @property
     def controller_uri(self) -> str:
@@ -140,6 +198,32 @@ class Controller:
     def _invalidate_cache(self):
         """Force a cache refresh on the next motion event (call after any action that changes view state)."""
         self._cache_time = 0.0
+
+    @staticmethod
+    def _flatten_commands(cat_node: dict) -> list[dict]:
+        """Return all leaf commands (type 2) from a single category node."""
+        result = []
+        def walk(nodes):
+            for node in nodes:
+                if node.get("type") == 2:
+                    result.append({"id": node["id"], "label": node.get("label", "")})
+                if "nodes" in node:
+                    walk(node["nodes"])
+        walk(cat_node.get("nodes", []))
+        return result
+
+    def _commands_to_hotkeys(self, commands: list[dict]) -> list[dict]:
+        """Convert a flat command list to the hotkey format used by the display."""
+        hotkeys = []
+        for c in commands:
+            hk = {"label": c["label"][:4].upper(), "action": f"onshape_{c['id']}"}
+            svg = self._svg_cache.get(c["id"])
+            if svg:
+                hk["svg"] = svg
+            hotkeys.append(hk)
+        while len(hotkeys) < 12:
+            hotkeys.append({"label": "", "action": "noop"})
+        return hotkeys[:12]
 
     async def start_mouse_event_stream(self):
         logging.info("Starting the mouse stream")
@@ -246,10 +330,19 @@ class Controller:
                 idx = int(action[7:]) - 1
             except ValueError:
                 return
+            # Context-aware: use Onshape's current command list when available
+            ctx_cmds = self._context_commands.get(self._active_set, [])
+            if idx < len(ctx_cmds):
+                await self._invoke_onshape_command(ctx_cmds[idx]["id"])
+                return
+            # Fall back to configured hotkey action
             if 0 <= idx < len(self.hotkeys):
                 sub = self.hotkeys[idx].get("action", "noop")
                 if sub != action:
                     await self._execute_action(sub)
+
+        elif action.startswith("onshape_"):
+            await self._invoke_onshape_command(action[8:])
 
         elif action == "menu":
             pass
@@ -431,6 +524,14 @@ class Controller:
         self.display.show_message(msg)
         await asyncio.sleep(0.8)
         self.display.show_hotkeys(self.hotkeys)
+
+    async def _invoke_onshape_command(self, command_id: str):
+        """Ask Onshape to execute a command by ID (e.g. 'extrude', 'LINESEGMENT')."""
+        logging.info("Invoking Onshape command: %s", command_id)
+        try:
+            await self.remote_write("command", command_id)
+        except Exception as exc:
+            logging.warning("command %r failed: %s", command_id, exc)
 
     async def _signal_motion(self):
         await self.remote_write("motion", True)
