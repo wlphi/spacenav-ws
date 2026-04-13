@@ -4,6 +4,7 @@ import logging
 import os
 import struct
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,8 @@ class Controller:
     Shift+V1-V3 saves the current view to that slot and persists to disk.
     """
 
+    CACHE_REFRESH_INTERVAL = 0.5  # seconds between slow-state refreshes
+
     def __init__(
         self,
         reader: asyncio.StreamReader,
@@ -96,6 +99,12 @@ class Controller:
         self.hotkeys: list[dict] = get_hotkeys()
         self.saved_views: dict[int, dict] = _load_saved_views()
 
+        # Cached slow-changing state (refreshed every CACHE_REFRESH_INTERVAL seconds)
+        self._cached_model_extents: list | None = None
+        self._cached_perspective: bool | None = None
+        self._cached_extents: list | None = None
+        self._cache_time: float = 0.0
+
         self.display = EnterpriseDisplay()
         self.display.show_hotkeys(self.hotkeys)
 
@@ -119,20 +128,38 @@ class Controller:
     async def remote_read(self, *args):
         return await self.wamp_state_handler.client_rpc(self.controller_uri, "self:read", *args)
 
+    async def _refresh_cache(self):
+        """Fetch slow-changing state from the client concurrently."""
+        self._cached_model_extents, self._cached_perspective, self._cached_extents = await asyncio.gather(
+            self.remote_read("model.extents"),
+            self.remote_read("view.perspective"),
+            self.remote_read("view.extents"),
+        )
+        self._cache_time = time.monotonic()
+
+    def _invalidate_cache(self):
+        """Force a cache refresh on the next motion event (call after any action that changes view state)."""
+        self._cache_time = 0.0
+
     async def start_mouse_event_stream(self):
         logging.info("Starting the mouse stream")
         while True:
             mouse_event = await self.reader.read(32)
-            if self.focus and self.subscribed:
-                nums = struct.unpack("iiiiiiii", mouse_event)
-                event = from_message(list(nums))
-                if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
-                    await self.update_client(event)
-                else:
-                    logging.warning(
-                        "Unknown client! Cannot send mouse events, client_metadata:%s",
-                        self.client_metadata,
-                    )
+            if not (self.focus and self.subscribed):
+                continue
+            # Drain any queued events so we only process the most recent one
+            while len(self.reader._buffer) >= 32:
+                mouse_event = bytes(self.reader._buffer[:32])
+                del self.reader._buffer[:32]
+            nums = struct.unpack("iiiiiiii", mouse_event)
+            event = from_message(list(nums))
+            if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
+                await self.update_client(event)
+            else:
+                logging.warning(
+                    "Unknown client! Cannot send mouse events, client_metadata:%s",
+                    self.client_metadata,
+                )
 
     # ------------------------------------------------------------------ #
     #  Top-level event router                                             #
@@ -166,6 +193,7 @@ class Controller:
             action,
         )
         await self._execute_action(action)
+        self._invalidate_cache()
 
     # ------------------------------------------------------------------ #
     #  Action dispatch                                                    #
@@ -439,8 +467,14 @@ class Controller:
     # ------------------------------------------------------------------ #
 
     async def _handle_motion(self, event: MotionEvent):
-        model_extents = await self.remote_read("model.extents")
-        perspective = await self.remote_read("view.perspective")
+        # Refresh slow-changing state periodically; only view.affine is read every frame.
+        if self._cached_model_extents is None or (time.monotonic() - self._cache_time) > self.CACHE_REFRESH_INTERVAL:
+            await self._refresh_cache()
+
+        model_extents = self._cached_model_extents
+        perspective = self._cached_perspective
+        extents = self._cached_extents
+
         curr_affine = np.asarray(
             await self.remote_read("view.affine"), dtype=np.float32
         ).reshape(4, 4)
@@ -453,26 +487,33 @@ class Controller:
         yaw   = 0.0 if self.lock_rotation else event.yaw
         roll  = 0.0 if self.lock_rotation else event.roll
 
-        angles = np.array([pitch, yaw, -roll]) * 0.02
+        angles = np.array([pitch, yaw, -roll]) * 0.01
         R_delta_cam = transform.Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
         R_world = R_cam @ R_delta_cam @ R_cam.T
 
         rot_delta = np.eye(4, dtype=np.float32)
         rot_delta[:3, :3] = R_world
-        trans_delta = np.eye(4, dtype=np.float32)
-        trans_delta[3, :3] = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.0005
 
+        # Apply rotation around model pivot first, then add camera-relative translation.
+        # Pan input is in camera space; multiply by R_cam to convert to world space so
+        # panning follows the screen axes regardless of camera orientation.
         pivot_pos, pivot_neg = self._get_affine_pivot_matrices(model_extents)
-        new_affine = trans_delta @ curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
+        new_affine = curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
 
+        extent_scale = sum(extents[3:6]) / 3.0 if extents else 1.0
+        cam_trans = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.000375 * extent_scale
+        new_affine[3, :3] += R_cam @ cam_trans
+
+        writes = [
+            self.remote_write("motion", True),
+            self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+        ]
         if not perspective:
-            extents = await self.remote_read("view.extents")
-            scale = 1.0 + event.y * 0.0002
-            await self.remote_write("motion", True)
-            await self.remote_write("view.extents", [c * scale for c in extents])
-        else:
-            await self.remote_write("motion", True)
-        await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
+            scale = 1.0 + event.y * 0.0001
+            new_extents = [c * scale for c in extents]
+            writes.append(self.remote_write("view.extents", new_extents))
+            self._cached_extents = new_extents  # keep cache in sync
+        await asyncio.gather(*writes)
 
     @staticmethod
     def _get_affine_pivot_matrices(model_extents):
