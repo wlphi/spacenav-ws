@@ -115,8 +115,15 @@ def _build_packet(bitmap: bytes) -> bytes:
     return bytes(header) + compressed
 
 
-_ICON_SIZE = 36   # px — icon rendered at this size, centred in top portion of cell
-_LABEL_FONT_SIZE = 14
+_ICON_SIZE = 44        # px — larger icon for better detail
+_LABEL_FONT_SIZE = 13  # slightly smaller to give more room to icon
+
+# ── Colour palette (dark theme) ──────────────────────────────────────────────
+_C_BG       = (10,  12,  17)    # overall background — near-black
+_C_CELL     = (22,  26,  36)    # per-cell dark-navy fill
+_C_GRID     = (48,  54,  70)    # grid dividers — muted slate-blue
+_C_LABEL    = (185, 195, 215)   # label text — cool off-white
+_C_ACCENT   = (55,  70, 100)    # top-edge accent stripe per cell
 
 
 def _svg_to_pil(svg_bytes: bytes, size: int):
@@ -131,46 +138,100 @@ def _svg_to_pil(svg_bytes: bytes, size: int):
         return None
 
 
+def _adapt_icon(icon) -> "Image":
+    """Make a light-background SVG icon legible on a dark display.
+
+    Onshape icons are designed for white UIs: they have coloured fills and
+    dark/black outlines on a transparent background.  On our black LCD the
+    outlines would vanish.  This function:
+      1. Boosts dark pixels toward white (outlines become visible).
+      2. Slightly desaturates colours for a muted, cohesive palette.
+      3. Leaves already-bright / saturated pixels mostly unchanged.
+    """
+    arr = np.array(icon, dtype=np.float32) / 255.0
+    r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+
+    # Perceptual luminance
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+
+    # Brightness boost: smoothly lifts dark pixels toward bright.
+    # boost=1 → fully white; boost=0 → original colour unchanged.
+    # Curve: pixels below lum≈0.45 get lifted; above that, untouched.
+    boost = np.clip(1.0 - lum / 0.45, 0.0, 1.0) ** 1.6
+
+    r2 = r + boost * (1.0 - r)
+    g2 = g + boost * (1.0 - g)
+    b2 = b + boost * (1.0 - b)
+
+    # Slight desaturation (blend 20 % toward grey) → "muted" palette
+    grey = 0.299 * r2 + 0.587 * g2 + 0.114 * b2
+    sat  = 0.80    # keep 80 % of colour, 20 % grey
+    r2 = r2 * sat + grey * (1.0 - sat)
+    g2 = g2 * sat + grey * (1.0 - sat)
+    b2 = b2 * sat + grey * (1.0 - sat)
+
+    out = np.stack([r2, g2, b2, a], axis=2)
+    out = (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+    from PIL import Image
+    return Image.fromarray(out, "RGBA")
+
+
 def render_hotkey_grid(hotkeys: list[dict]) -> bytes:
     """Render a 6×2 grid of icon+label cells and return a BGR565 packet."""
     from PIL import Image, ImageDraw
-    img = Image.new("RGB", (DISPLAY_W, DISPLAY_H), color=(0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    label_font = _get_font(_LABEL_FONT_SIZE)
 
-    # Grid lines
+    img  = Image.new("RGB", (DISPLAY_W, DISPLAY_H), color=_C_BG)
+    draw = ImageDraw.Draw(img)
+
+    # ── Per-cell background + top-edge accent ──────────────────────────
+    for row in range(_ROWS):
+        for col in range(_COLS):
+            x0 = col * _CELL_W + 1
+            y0 = row * _CELL_H + 1
+            x1 = (col + 1) * _CELL_W - 1
+            y1 = (row + 1) * _CELL_H - 1
+            draw.rectangle([x0, y0, x1, y1], fill=_C_CELL)
+            # thin accent stripe at top of each cell
+            draw.line([(x0, y0), (x1, y0)], fill=_C_ACCENT, width=2)
+
+    # ── Grid dividers ───────────────────────────────────────────────────
     for col in range(1, _COLS):
         x = col * _CELL_W
-        draw.line([(x, 0), (x, DISPLAY_H - 1)], fill=(60, 60, 60), width=1)
+        draw.line([(x, 0), (x, DISPLAY_H - 1)], fill=_C_GRID, width=1)
     for row in range(1, _ROWS):
         y = row * _CELL_H
-        draw.line([(0, y), (DISPLAY_W - 1, y)], fill=(60, 60, 60), width=1)
+        draw.line([(0, y), (DISPLAY_W - 1, y)], fill=_C_GRID, width=1)
+
+    label_font = _get_font(_LABEL_FONT_SIZE)
+
+    # Icon area height (above label)
+    _label_h  = _LABEL_FONT_SIZE + 6   # label text + bottom padding
+    _icon_area = _CELL_H - _label_h    # pixels available for the icon
 
     for i, hk in enumerate(hotkeys[:12]):
-        label = str(hk.get("label", "")).upper()
-        col = i % _COLS
-        row = i // _COLS
+        label  = str(hk.get("label", "")).upper()
+        col    = i % _COLS
+        row    = i // _COLS
         cell_x = col * _CELL_W
         cell_y = row * _CELL_H
-        cx = cell_x + _CELL_W // 2
+        cx     = cell_x + _CELL_W // 2
 
-        svg_data = hk.get("svg")  # base64-decoded SVG bytes, set by controller
+        svg_data = hk.get("svg")
         if svg_data:
             icon = _svg_to_pil(svg_data, _ICON_SIZE)
             if icon:
-                # Tint white/light pixels to match foreground colour
-                icon_rgb = Image.new("RGB", icon.size, (220, 220, 220))
-                icon_rgb.putalpha(icon.split()[3])  # keep alpha
+                icon = _adapt_icon(icon)
+                # Centre icon horizontally; vertically within icon area
                 ix = cx - _ICON_SIZE // 2
-                iy = cell_y + 4
-                img.paste(icon_rgb, (ix, iy), mask=icon.split()[3])
+                iy = cell_y + (_icon_area - _ICON_SIZE) // 2 + 3
+                img.paste(icon.convert("RGB"), (ix, iy), mask=icon.split()[3])
 
         if label:
             bbox = label_font.getbbox(label)
-            tw = bbox[2] - bbox[0]
-            lx = cx - tw // 2 - bbox[0]
-            ly = cell_y + _CELL_H - _LABEL_FONT_SIZE - 5
-            draw.text((lx, ly), label, fill=(255, 255, 255), font=label_font)
+            tw   = bbox[2] - bbox[0]
+            lx   = cx - tw // 2 - bbox[0]
+            ly   = cell_y + _CELL_H - _label_h + 1
+            draw.text((lx, ly), label, fill=_C_LABEL, font=label_font)
 
     return _build_packet(_img_to_bgr565(img))
 
