@@ -206,8 +206,34 @@ def _adapt_icon(icon):
     return Image.fromarray(out, "RGBA")
 
 
-def render_hotkey_grid(hotkeys: list[dict]) -> bytes:
-    """Render a 6×2 grid of icon+label cells and return a BGR565 packet."""
+# Sensitivity bar constants
+_SENS_BAR_H = 5  # px — thin strip at the very bottom of the display
+_SENS_LEVELS = 5
+_C_SENS_ON = (80, 160, 255)  # filled segment — cool blue
+_C_SENS_OFF = (30, 35, 50)  # empty segment — near-background
+
+
+def _draw_sensitivity_bar(draw, level: int) -> None:
+    """Draw a 5-segment sensitivity indicator across the bottom of the display.
+
+    level: 1–5.  Segments 1..level are filled; level+1..5 are dim.
+    """
+    seg_w = DISPLAY_W // _SENS_LEVELS  # 128 px per segment
+    y0 = DISPLAY_H - _SENS_BAR_H
+    y1 = DISPLAY_H - 1
+    for i in range(_SENS_LEVELS):
+        x0 = i * seg_w + 1
+        x1 = (i + 1) * seg_w - 2
+        color = _C_SENS_ON if i < level else _C_SENS_OFF
+        draw.rectangle([x0, y0, x1, y1], fill=color)
+
+
+def render_hotkey_grid(hotkeys: list[dict], sensitivity_level: int = 0) -> bytes:
+    """Render a 6×2 grid of icon+label cells and return a BGR565 packet.
+
+    sensitivity_level: 1–5 draws a thin indicator bar at the bottom;
+                       0 (default) omits it.
+    """
     from PIL import Image, ImageDraw
 
     img = Image.new("RGB", (DISPLAY_W, DISPLAY_H), color=_C_BG)
@@ -265,6 +291,42 @@ def render_hotkey_grid(hotkeys: list[dict]) -> bytes:
             lx = cx - tw // 2 - bbox[0]
             ly = cell_y + _CELL_H - _label_h + 1
             draw.text((lx, ly), label, fill=_C_LABEL, font=label_font)
+
+    if 1 <= sensitivity_level <= _SENS_LEVELS:
+        _draw_sensitivity_bar(draw, sensitivity_level)
+
+    return _build_packet(_img_to_bgr565(img))
+
+
+def render_sensitivity_screen(level: int) -> bytes:
+    """Full-screen sensitivity change banner: level number + dot bar."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (DISPLAY_W, DISPLAY_H), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Large level number on the left
+    num_font = _get_font(80)
+    num_text = str(level)
+    nb = num_font.getbbox(num_text)
+    nx = 60 - (nb[2] - nb[0]) // 2 - nb[0]
+    ny = (DISPLAY_H - (nb[3] - nb[1])) // 2 - nb[1]
+    draw.text((nx, ny), num_text, fill=_C_SENS_ON, font=num_font)
+
+    # "SENS" label above the dots
+    lbl_font = _get_font(18)
+    draw.text((130, 20), "SENSITIVITY", fill=(120, 130, 150), font=lbl_font)
+
+    # Five large dots centred on the right side
+    dot_r = 12
+    dot_gap = 16
+    total_w = _SENS_LEVELS * (dot_r * 2) + (_SENS_LEVELS - 1) * dot_gap
+    dot_x0 = 130 + (DISPLAY_W - 130 - total_w) // 2
+    dot_y = DISPLAY_H // 2
+    for i in range(_SENS_LEVELS):
+        cx = dot_x0 + i * (dot_r * 2 + dot_gap) + dot_r
+        color = _C_SENS_ON if i < level else _C_SENS_OFF
+        draw.ellipse([cx - dot_r, dot_y - dot_r, cx + dot_r, dot_y + dot_r], fill=color)
 
     return _build_packet(_img_to_bgr565(img))
 
@@ -533,12 +595,22 @@ class EnterpriseDisplay:
     # High-level update methods
     # ------------------------------------------------------------------
 
-    def show_hotkeys(self, hotkeys: list[dict]) -> None:
-        """Display the 12 hotkey labels in a 4×3 grid."""
+    def show_hotkeys(self, hotkeys: list[dict], sensitivity_level: int = 0) -> None:
+        """Display the 12 hotkey labels in a 6×2 grid.
+
+        sensitivity_level 1–5 draws the indicator bar; 0 omits it.
+        """
         try:
-            self._send(render_hotkey_grid(hotkeys))
+            self._send(render_hotkey_grid(hotkeys, sensitivity_level))
         except Exception as exc:
             logging.debug("Display: show_hotkeys failed — %s", exc)
+
+    def show_sensitivity(self, level: int) -> None:
+        """Display the sensitivity change screen (level 1–5)."""
+        try:
+            self._send(render_sensitivity_screen(level))
+        except Exception as exc:
+            logging.debug("Display: show_sensitivity failed — %s", exc)
 
     def show_message(self, text: str) -> None:
         """Display a centred status message."""

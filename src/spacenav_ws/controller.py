@@ -159,9 +159,15 @@ class Controller:
         # Onshape-level motion sensitivity multipliers (config.json → "motion").
         # These scale on top of the baseline constants; 1.0 = unchanged behaviour.
         _mc = load_config().get("motion", {})
-        self._rotation_scale: float = float(_mc.get("rotation_scale", 1.0))
-        self._translation_scale: float = float(_mc.get("translation_scale", 1.0))
-        self._zoom_scale: float = float(_mc.get("zoom_scale", 1.0))
+        self._base_rotation_scale: float = float(_mc.get("rotation_scale", 1.0))
+        self._base_translation_scale: float = float(_mc.get("translation_scale", 1.0))
+        self._base_zoom_scale: float = float(_mc.get("zoom_scale", 1.0))
+
+        # Runtime sensitivity level (1–5); multiplied on top of base scales.
+        # Level 3 = 1.0× (config value unchanged).
+        self._SENSITIVITY_MULTIPLIERS = (0.2, 0.5, 1.0, 2.0, 4.0)
+        self._sensitivity_level: int = 3  # 1-indexed
+        self._apply_sensitivity()
 
         # Context-aware commands sent by Onshape via client_update
         self._active_set: str = ""
@@ -433,7 +439,7 @@ class Controller:
             await self._invoke_onshape_command(action[8:])
 
         elif action == "menu":
-            pass
+            await self._action_cycle_sensitivity()
 
         else:
             logging.warning("Unknown action: %r", action)
@@ -818,7 +824,37 @@ class Controller:
         display_cmds = self._context_commands.get(self._active_set, [])
         hotkeys = self._commands_to_hotkeys(display_cmds[:12]) if display_cmds else self.hotkeys
         loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, self.display.show_hotkeys, hotkeys)
+        loop.run_in_executor(None, self.display.show_hotkeys, hotkeys, self._sensitivity_level)
+
+    # ------------------------------------------------------------------ #
+    #  Sensitivity                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _apply_sensitivity(self) -> None:
+        """Recompute the three scale fields from base values × current level multiplier."""
+        m = self._SENSITIVITY_MULTIPLIERS[self._sensitivity_level - 1]
+        self._rotation_scale = self._base_rotation_scale * m
+        self._translation_scale = self._base_translation_scale * m
+        self._zoom_scale = self._base_zoom_scale * m
+
+    async def _action_cycle_sensitivity(self) -> None:
+        """Step to the next sensitivity level (wraps 5 → 1) and update display."""
+        self._sensitivity_level = (self._sensitivity_level % 5) + 1
+        self._apply_sensitivity()
+        logging.info(
+            "Sensitivity level %d/%d  (×%.2f)",
+            self._sensitivity_level,
+            5,
+            self._SENSITIVITY_MULTIPLIERS[self._sensitivity_level - 1],
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            self.display.show_sensitivity,
+            self._sensitivity_level,
+        )
+        await asyncio.sleep(1.2)
+        self._restore_context_display()
 
     # ------------------------------------------------------------------ #
     #  Key injection (uinput primary, xdotool fallback for X11)           #
