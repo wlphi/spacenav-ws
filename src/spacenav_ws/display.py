@@ -6,11 +6,15 @@ USB interface (interface 0, bulk OUT endpoint 0x01).
 Protocol (reverse-engineered by TheHoodedFoot/SpaceLCD):
   1. Render a 640×150 RGB image with Pillow.
   2. Convert pixels to BGR565 (16-bit, little-endian).
-  3. Raw-DEFLATE compress the bitmap (no zlib wrapper; wbits=-15).
+  3. Raw-DEFLATE compress (wbits=-15, Z_FIXED, memLevel=9 — device requires
+     fixed Huffman tables; memLevel=9 matches SpaceLCD's deflateInit2 params).
   4. Prepend a 512-byte header:
        [0x11, 0x0F, len_lo, len_hi, <zeros to 0x1B>,
         len_lo (at 0x1C), len_hi (at 0x1D), <zeros to 0x1FF>]
-  5. Send the whole thing to EP 0x01 in 64-byte bulk chunks.
+  5. Before each bulk transfer: send HID Feature report [0x14,0xfc,0xff,0x07,0x1c]
+     via HIDIOCSFEATURE ioctl on /dev/hidrawN (wValue=0x0314 in SpaceLCD terms).
+     This switches the LCD controller into "accept new frame" mode.
+  6. Send compressed packet to EP 0x01 in 64-byte bulk chunks.
 
 Requires:
   pip install pyusb pillow numpy
@@ -97,8 +101,13 @@ def _img_to_bgr565(img) -> bytes:
 
 
 def _compress(raw: bytes) -> bytes:
-    """Raw-DEFLATE compress (no zlib header/trailer)."""
-    c = zlib.compressobj(level=6, wbits=-15, strategy=zlib.Z_FIXED)
+    """Raw-DEFLATE compress (no zlib header/trailer).
+
+    Parameters match SpaceLCD's deflateInit2 exactly:
+    level=6 (Z_DEFAULT_COMPRESSION), wbits=-15 (raw deflate),
+    memLevel=9 (max), strategy=Z_FIXED (fixed Huffman tables required by device).
+    """
+    c = zlib.compressobj(level=6, wbits=-15, memLevel=9, strategy=zlib.Z_FIXED)
     return c.compress(raw) + c.flush()
 
 
@@ -301,6 +310,59 @@ def _find_enterprise_event_path() -> str | None:
     return None
 
 
+def _find_enterprise_hidraw_path() -> str | None:
+    """Return the /dev/hidrawN path for the SpaceMouse Enterprise HID interface.
+
+    Used to send HID Feature reports (via HIDIOCSFEATURE ioctl) without
+    claiming interface 1, which is owned by the kernel HID driver / spacenavd.
+    """
+    import glob as _glob
+
+    for uevent in _glob.glob("/sys/class/hidraw/hidraw*/device/uevent"):
+        try:
+            text = Path(uevent).read_text()
+            if "256F" in text.upper() and "C633" in text.upper():
+                node = uevent.split("/")[4]  # "hidrawN"
+                return f"/dev/{node}"
+        except Exception:
+            pass
+    return None
+
+
+# HID Feature report sent before each bulk frame transfer.
+# Switches the LCD controller into "accept new frame" mode.
+# Equivalent to SpaceLCD's libusb_control_transfer wValue=0x0314.
+_LCD_FRAME_PREPARE = bytes([0x14, 0xFC, 0xFF, 0x07, 0x1C])
+
+# HID Feature report to set LCD brightness to maximum.
+_LCD_BRIGHTNESS_ON = bytes([0x11, 0x64])
+
+
+def _lcd_send_feature(hidraw_path: str, data: bytes) -> bool:
+    """Send a HID Feature report via HIDIOCSFEATURE ioctl.
+
+    Does not require claiming the HID interface — the kernel HID driver
+    forwards Feature reports to the device without interfering with spacenavd.
+    """
+    import ctypes
+    import fcntl
+    import os as _os
+
+    # HIDIOCSFEATURE(len) = _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x06, len)
+    ioctl_nr = (3 << 30) | (0x48 << 8) | 0x06 | (len(data) << 16)
+    try:
+        fd = _os.open(hidraw_path, _os.O_RDWR)
+        try:
+            buf = (ctypes.c_uint8 * len(data))(*data)
+            fcntl.ioctl(fd, ioctl_nr, buf)
+            return True
+        finally:
+            _os.close(fd)
+    except Exception as exc:
+        logging.debug("_lcd_send_feature(%s) failed — %s", hidraw_path, exc)
+        return False
+
+
 def set_lock_led(on: bool) -> None:
     """Light or extinguish the rotation-lock LED on the SpaceMouse Enterprise.
 
@@ -326,6 +388,7 @@ def set_lock_led(on: bool) -> None:
         # input_event: { struct timeval tv; __u16 type; __u16 code; __s32 value; }
         # On 64-bit Linux timeval = two int64 fields (sec, usec).
         import os as _os
+
         t = int(_time.time())
         ev = struct.pack("qqHHi", t, 0, EV_LED, LED_SUSPEND, 1 if on else 0)
         fd = _os.open(path, _os.O_WRONLY | _os.O_NONBLOCK)
@@ -357,6 +420,7 @@ class EnterpriseDisplay:
 
     def __init__(self) -> None:
         self._handle = None
+        self._hidraw: str | None = None
         self._open()
 
     def _open(self) -> None:
@@ -400,12 +464,16 @@ class EnterpriseDisplay:
                     dev.detach_kernel_driver(_USB_IFACE)
                 usb.util.claim_interface(dev, _USB_IFACE)
                 self._handle = dev
-                logging.info(
-                    "Display: opened SpaceMouse Enterprise LCD (interface %d, EP 0x%02X)",
+                self._hidraw = _find_enterprise_hidraw_path()
+                # Turn on LCD backlight / switch to host-driven mode.
+                if self._hidraw:
+                    _lcd_send_feature(self._hidraw, _LCD_BRIGHTNESS_ON)
+                logging.warning(
+                    "Display: opened SpaceMouse Enterprise LCD (interface %d, EP 0x%02X, hidraw=%s)",
                     _USB_IFACE,
                     _USB_EP,
+                    self._hidraw,
                 )
-                self.clear()  # blank any leftover content from previous session
                 break
             except Exception as exc:
                 last_exc = exc
@@ -437,14 +505,24 @@ class EnterpriseDisplay:
     def _send(self, packet: bytes) -> bool:
         """Send a pre-built display packet via USB bulk transfer.
 
-        The entire packet is sent in a single write() call.  pyusb/libusb
-        splits it into 64-byte USB packets internally — the device sees one
-        complete transfer and processes its header + compressed bitmap together.
+        Sequence (matches SpaceLCD protocol):
+          1. HID Feature report [0x14,...] via HIDIOCSFEATURE — switches LCD
+             controller into "accept new frame" mode (wValue=0x0314 equivalent).
+          2. Packet data sent to EP 0x01 in 64-byte bulk chunks.
         """
         if self._handle is None:
             return False
+        # Step 1: tell the LCD controller a new frame is coming.
+        if self._hidraw:
+            _lcd_send_feature(self._hidraw, _LCD_FRAME_PREPARE)
+        # Step 2: send compressed frame data in 64-byte bulk chunks.
         try:
-            self._handle.write(_USB_EP, packet, _USB_TIMEOUT)
+            data = bytearray(packet)
+            offset = 0
+            while offset < len(data):
+                chunk = data[offset : offset + _USB_CHUNK]
+                self._handle.write(_USB_EP, chunk, _USB_TIMEOUT)
+                offset += _USB_CHUNK
             return True
         except Exception as exc:
             logging.debug("Display: write failed — %s", exc)
