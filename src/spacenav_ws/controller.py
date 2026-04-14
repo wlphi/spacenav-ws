@@ -176,7 +176,7 @@ class Controller:
         self._last_display_key: tuple = ()  # debounce display updates
 
         self.display = _display
-        self._restore_context_display()
+        asyncio.ensure_future(self._restore_context_display())
 
     async def subscribe(self, msg: Subscribe):
         logging.info("handling subscribe %s", msg)
@@ -392,7 +392,7 @@ class Controller:
             logging.info(msg)
             self.display.show_message(msg)
             await asyncio.sleep(1.2)
-            self._restore_context_display()
+            asyncio.ensure_future(self._restore_context_display())
 
         elif action == "toggle_perspective":
             current = await self.remote_read("view.perspective")
@@ -509,7 +509,7 @@ class Controller:
         await self.remote_write("motion", False)
         self.display.show_message(view_name.upper())
         await asyncio.sleep(0.8)
-        self._restore_context_display()
+        asyncio.ensure_future(self._restore_context_display())
 
     async def _action_fit(self):
         curr_affine = await self.remote_read("view.affine")
@@ -690,7 +690,7 @@ class Controller:
             logging.warning("save_view_%d: could not read view state — %s", slot, exc)
             self.display.show_message("ERR SAVE")
             await asyncio.sleep(0.8)
-            self._restore_context_display()
+            asyncio.ensure_future(self._restore_context_display())
             return
         logging.debug(
             "save_view_%d: affine=%s extents=%s perspective=%s",
@@ -709,7 +709,7 @@ class Controller:
         logging.info(msg)
         self.display.show_message(msg)
         await asyncio.sleep(0.8)
-        self._restore_context_display()
+        asyncio.ensure_future(self._restore_context_display())
 
     async def _action_recall_view(self, slot: int):
         view = self.saved_views.get(slot)
@@ -718,7 +718,7 @@ class Controller:
             logging.info("Custom view slot %d is empty", slot)
             self.display.show_message(msg)
             await asyncio.sleep(0.8)
-            self._restore_context_display()
+            asyncio.ensure_future(self._restore_context_display())
             return
         logging.debug(
             "recall_view_%d: writing affine=%s extents=%s perspective=%s",
@@ -740,7 +740,7 @@ class Controller:
         msg = f"VIEW V{slot}"
         self.display.show_message(msg)
         await asyncio.sleep(0.8)
-        self._restore_context_display()
+        asyncio.ensure_future(self._restore_context_display())
 
     async def _invoke_onshape_command(self, command_id: str):
         """Ask Onshape to execute a command by ID (e.g. 'Part Studio-extrude').
@@ -814,17 +814,17 @@ class Controller:
         """Briefly show a context banner, then restore the hotkey grid."""
         labels = {"Sketch": "SKETCH LOCK", "Drawing": "2D MODE"}
         msg = labels.get(context, f"{context.upper()} MODE")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.display.show_message, msg)
         await asyncio.sleep(0.8)
-        self._restore_context_display()
+        await self._restore_context_display()
 
-    def _restore_context_display(self) -> None:
+    async def _restore_context_display(self) -> None:
         """(Re-)draw the hotkey grid for the current context."""
         display_cmds = self._context_commands.get(self._active_set, [])
         hotkeys = self._commands_to_hotkeys(display_cmds[:12]) if display_cmds else self.hotkeys
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, self.display.show_hotkeys, hotkeys, self._sensitivity_level)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.display.show_hotkeys, hotkeys, self._sensitivity_level)
 
     # ------------------------------------------------------------------ #
     #  Sensitivity                                                         #
@@ -841,20 +841,18 @@ class Controller:
         """Step to the next sensitivity level (wraps 5 → 1) and update display."""
         self._sensitivity_level = (self._sensitivity_level % 5) + 1
         self._apply_sensitivity()
-        logging.info(
+        logging.warning(
             "Sensitivity level %d/%d  (×%.2f)",
             self._sensitivity_level,
             5,
             self._SENSITIVITY_MULTIPLIERS[self._sensitivity_level - 1],
         )
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            self.display.show_sensitivity,
-            self._sensitivity_level,
-        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.display.show_sensitivity, self._sensitivity_level)
         await asyncio.sleep(1.2)
-        self._restore_context_display()
+        display_cmds = self._context_commands.get(self._active_set, [])
+        hotkeys = self._commands_to_hotkeys(display_cmds[:12]) if display_cmds else self.hotkeys
+        await loop.run_in_executor(None, self.display.show_hotkeys, hotkeys, self._sensitivity_level)
 
     # ------------------------------------------------------------------ #
     #  Key injection (uinput primary, xdotool fallback for X11)           #
