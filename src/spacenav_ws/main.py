@@ -10,20 +10,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from rich.logging import RichHandler
 
-from spacenav_ws.controller import create_mouse_controller
+from spacenav_ws.buttons import load_config
+from spacenav_ws.controller import Controller, create_mouse_controller
 from spacenav_ws.spacenav import from_message, get_async_spacenav_socket_reader
 from spacenav_ws.wamp import WampSession
-import spacenav_ws.cursor_state as cursor_state
+
+# Reference to the currently active controller (set when a client connects to /).
+# Used by the /cursor endpoint and /events SSE to access per-connection cursor state.
+_active_controller: Controller | None = None
 
 # TODO: This handler isn't used for the uvicorn logs and I can't be bothered finding the magic logging incantations to make it so.
 logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 
-ORIGINS = [
+_DEFAULT_ORIGINS = [
     "https://127.51.68.120",
     "https://127.51.68.120:8181",
     "https://3dconnexion.com",
     "https://cad.onshape.com",
 ]
+# Override via ~/.config/spacenav-ws/config.json → "cors_origins": ["https://..."]
+ORIGINS = load_config().get("cors_origins", _DEFAULT_ORIGINS)
 
 CERT_FILE = Path(__file__).parent / "certs" / "ip.crt"
 KEY_FILE = Path(__file__).parent / "certs" / "ip.key"
@@ -71,7 +77,19 @@ async def get_mouse_event_generator():
         mouse_event = await reader.readexactly(32)
         nums = struct.unpack("iiiiiiii", mouse_event)
         event_data = from_message(list(nums))
-        yield f"data: {event_data}\n\n"  # <- SSE format
+        c = _active_controller
+        if c is not None:
+            debug = (
+                f" | ndc=({c._cursor_ndc[0]:.3f},{c._cursor_ndc[1]:.3f})"
+                f" active={c._cursor_active}"
+                f" pivot=[{c._cursor_debug_pivot[0]:.3f},{c._cursor_debug_pivot[1]:.3f},{c._cursor_debug_pivot[2]:.3f}]"
+                f" dist={c._cursor_debug_dist:.3f}"
+                f" vh={c._cursor_debug_viewport_half:.3f}"
+                f" cursor={c._cursor_debug_used_cursor}"
+            )
+        else:
+            debug = " | no active controller"
+        yield f"data: {event_data}{debug}\n\n"
 
 
 @app.get("/events")
@@ -84,28 +102,37 @@ async def event_stream():
 async def cursor_endpoint(ws: WebSocket):
     """Receives mouse cursor NDC coords from the userscript for pivot computation."""
     await ws.accept()
-    cursor_state.active = True
+    if _active_controller is not None:
+        _active_controller._cursor_active = True
     try:
         while True:
             data = await ws.receive_json()
-            cursor_state.ndc[0] = float(data.get("x", 0.0))
-            cursor_state.ndc[1] = float(data.get("y", 0.0))
+            if _active_controller is not None:
+                _active_controller._cursor_ndc[0] = float(data.get("x", 0.0))
+                _active_controller._cursor_ndc[1] = float(data.get("y", 0.0))
     except Exception:
         pass
     finally:
-        cursor_state.active = False
+        if _active_controller is not None:
+            _active_controller._cursor_active = False
 
 
 @app.websocket("/")
 async def nlproxy(ws: WebSocket):
     """This is the websocket that webapplications should connect to for mouse data"""
+    global _active_controller
     wamp_session = WampSession(ws)
     spacenav_reader, _ = await get_async_spacenav_socket_reader()
     ctrl = await create_mouse_controller(wamp_session, spacenav_reader)
-    # TODO, better error handling then just dropping the websocket disconnect on the floor?
-    async with asyncio.TaskGroup() as tg:
-        tg.create_task(ctrl.start_mouse_event_stream(), name="mouse")
-        tg.create_task(ctrl.wamp_state_handler.start_wamp_message_stream(), name="wamp")
+    _active_controller = ctrl
+    try:
+        # TODO, better error handling then just dropping the websocket disconnect on the floor?
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(ctrl.start_mouse_event_stream(), name="mouse")
+            tg.create_task(ctrl.wamp_state_handler.start_wamp_message_stream(), name="wamp")
+    finally:
+        if _active_controller is ctrl:
+            _active_controller = None
 
 
 @cli.command()

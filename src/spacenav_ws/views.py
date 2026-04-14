@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 
 
-def _look_at(look: tuple | list, up: tuple | list = (0., 0., 1.)) -> list[float]:
+def _look_at(look: tuple | list, up: tuple | list = (0.0, 0.0, 1.0)) -> list[float]:
     """Build a 4×4 view matrix from a look direction and an up hint.
 
     The camera looks in ``-Z`` camera-space, so:
@@ -26,20 +26,20 @@ def _look_at(look: tuple | list, up: tuple | list = (0., 0., 1.)) -> list[float]
         cam_Y_world = cam_Z_world × cam_X_world
     """
     d = np.asarray(look, dtype=np.float64)
-    u = np.asarray(up,   dtype=np.float64)
+    u = np.asarray(up, dtype=np.float64)
     d = d / np.linalg.norm(d)
 
     cam_x = np.cross(d, u)
-    if np.linalg.norm(cam_x) < 1e-9:          # look ‖ up — use fallback
-        u = np.array([0., 1., 0.])
+    if np.linalg.norm(cam_x) < 1e-9:  # look ‖ up — use fallback
+        u = np.array([0.0, 1.0, 0.0])
         cam_x = np.cross(d, u)
     cam_x /= np.linalg.norm(cam_x)
 
-    cam_z = -d                                  # camera -Z = look direction
+    cam_z = -d  # camera -Z = look direction
     cam_y = np.cross(cam_z, cam_x)
     cam_y /= np.linalg.norm(cam_y)
 
-    R = np.array([cam_x, cam_y, cam_z])        # rows = camera axes in world space
+    R = np.array([cam_x, cam_y, cam_z])  # rows = camera axes in world space
     m = np.eye(4, dtype=np.float64)
     m[:3, :3] = R
     return m.reshape(-1).tolist()
@@ -52,21 +52,21 @@ def _look_at(look: tuple | list, up: tuple | list = (0., 0., 1.)) -> list[float]
 #   identity matrix  →  Top view   (camera at +Z looking straight down)
 #   Rx(-90°)         →  Front view (camera at -Y looking in +Y direction)
 
-_Z_UP = (0., 0., 1.)
+_Z_UP = (0.0, 0.0, 1.0)
 
 VIEW_MATRICES: dict[str, list[float]] = {
     # ── primary orthographic views ──────────────────────────────────────
-    "top":    _look_at((0.,  0., -1.), (0., 1., 0.)),  # look down  (-Z), image-up = +Y
-    "bottom": _look_at((0.,  0.,  1.), (0., -1., 0.)), # look up    (+Z), image-up = -Y (front faces down)
-    "front":  _look_at((0.,  1.,  0.), _Z_UP),          # look forward (+Y), up = +Z
-    "back":   _look_at((0., -1.,  0.), _Z_UP),          # look backward(-Y), up = +Z
-    "right":  _look_at((-1., 0.,  0.), _Z_UP),          # from +X side, look in -X
-    "left":   _look_at(( 1., 0.,  0.), _Z_UP),          # from -X side, look in +X
+    "top": _look_at((0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),  # look down  (-Z), image-up = +Y
+    "bottom": _look_at((0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),  # look up    (+Z), image-up = -Y (front faces down)
+    "front": _look_at((0.0, 1.0, 0.0), _Z_UP),  # look forward (+Y), up = +Z
+    "back": _look_at((0.0, -1.0, 0.0), _Z_UP),  # look backward(-Y), up = +Z
+    "right": _look_at((-1.0, 0.0, 0.0), _Z_UP),  # from +X side, look in -X
+    "left": _look_at((1.0, 0.0, 0.0), _Z_UP),  # from -X side, look in +X
     # ── isometric views ─────────────────────────────────────────────────
     # ISO1: front-right-top corner  (look from +X, -Y, +Z corner toward origin)
-    "iso1":   _look_at((-1.,  1., -1.), _Z_UP),
+    "iso1": _look_at((-1.0, 1.0, -1.0), _Z_UP),
     # ISO2: front-left-top corner   (look from -X, -Y, +Z corner toward origin)
-    "iso2":   _look_at(( 1.,  1., -1.), _Z_UP),
+    "iso2": _look_at((1.0, 1.0, -1.0), _Z_UP),
 }
 
 

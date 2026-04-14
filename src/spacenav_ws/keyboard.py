@@ -18,6 +18,7 @@ The shortcut map can be extended via ~/.config/spacenav-ws/shortcuts.json:
         "myLeafId": "ctrl+k"
     }
 """
+
 from __future__ import annotations
 
 import json
@@ -33,75 +34,72 @@ from pathlib import Path
 SHORTCUTS: dict[str, str] = {
     # ── Part Studio ──────────────────────────────────────────────────────
     # These are Onshape's documented shortcuts (cad.onshape.com/help/Content/shortcut_keys.htm)
-    "extrude":          "shift+e",
-    "revolve":          "shift+w",
-    "newSketch":        "shift+s",
-    "sketch":           "shift+s",
-    "fillet":           "shift+f",
+    "extrude": "shift+e",
+    "revolve": "shift+w",
+    "newSketch": "shift+s",
+    "sketch": "shift+s",
+    "fillet": "shift+f",
     # No default Onshape shortcuts for the following — assign them in
     # Onshape Preferences → Keyboard Shortcuts, then mirror here:
-    "chamfer":          "shift+c",    # user-assigned example
-    "draft":            "shift+d",    # user-assigned example
-    "shell":            "shift+h",    # user-assigned example
-    "mirror":           "shift+m",    # user-assigned example
-    "pattern":          "shift+p",    # user-assigned example
-    "sweep":            "shift+a",    # user-assigned
-    "loft":             "shift+k",    # user-assigned
-    "thicken":          "shift+o",    # user-assigned
-    "enclose":          "shift+u",    # user-assigned
-    "faceBlend":        "shift+j",    # user-assigned
-    "bodyDraft":        "shift+g",    # user-assigned
-
+    "chamfer": "shift+c",  # user-assigned example
+    "draft": "shift+d",  # user-assigned example
+    "shell": "shift+h",  # user-assigned example
+    "mirror": "shift+m",  # user-assigned example
+    "pattern": "shift+p",  # user-assigned example
+    "sweep": "shift+a",  # user-assigned
+    "loft": "shift+k",  # user-assigned
+    "thicken": "shift+o",  # user-assigned
+    "enclose": "shift+u",  # user-assigned
+    "faceBlend": "shift+j",  # user-assigned
+    "bodyDraft": "shift+g",  # user-assigned
     # ── Sketch (real IDs captured from Onshape command tree) ─────────────
-    "LINESEGMENT":              "l",
-    "MIDPOINTLINE":             "l",    # midpoint line, same tool family
+    "LINESEGMENT": "l",
+    "MIDPOINTLINE": "l",  # midpoint line, same tool family
     # Circles — "C" = Center point circle; 3-point perimeter circle has no default
-    "CIRCLE_CENTER_RADIUS":     "c",    # "Center point circle"
-    "CIRCLE":                   "c",    # generic fallback
+    "CIRCLE_CENTER_RADIUS": "c",  # "Center point circle"
+    "CIRCLE": "c",  # generic fallback
     # Rectangles
-    "RECTANGLE_CENTER":         "r",    # "Center point rectangle"  (Onshape default: R)
-    "RECTANGLE_TWO_CORNERS":    "g",    # "Corner rectangle"        (Onshape default: G)
+    "RECTANGLE_CENTER": "r",  # "Center point rectangle"  (Onshape default: R)
+    "RECTANGLE_TWO_CORNERS": "g",  # "Corner rectangle"        (Onshape default: G)
     # Arcs
-    "ARC_START_END_RADIUS":     "a",    # "3 point arc"
-    "ARC_TANGENT":              "a",    # "Tangent arc" — no default, use A as fallback
-    "CENTER_ARC":               "a",    # "Center point arc" — no default, use A as fallback
+    "ARC_START_END_RADIUS": "a",  # "3 point arc"
+    "ARC_TANGENT": "a",  # "Tangent arc" — no default, use A as fallback
+    "CENTER_ARC": "a",  # "Center point arc" — no default, use A as fallback
     # Sketch constraints & tools
-    "DIMENSION":                "d",
-    "TRIM":                     "m",    # Onshape uses M (not T) for trim
-    "EXTEND":                   "x",
-    "OFFSET":                   "o",
-    "SPLIT":                    "x",    # no default; X (extend) as fallback
-    "TOGGLE_CONSTRUCTION":      "q",    # "Construction"
-    "CONSTRUCTION":             "q",
-    "HORIZONTAL":               "h",
-    "VERTICAL":                 "v",
-    "EQUAL":                    "e",
-    "PARALLEL":                 "b",
-    "TANGENT":                  "t",
-    "COINCIDENT":               "i",
-    "PERPENDICULAR":            "shift+l",
-    "MIDPOINT":                 "shift+m",
-    "TEXT_RECTANGLE_TWO_CORNERS": "shift+t",   # "Text"
-    "USE":                      "u",           # "Use / project" (Onshape default: U)
-    "FILLET":                   "shift+f",     # Sketch fillet (Onshape default: Shift+F)
+    "DIMENSION": "d",
+    "TRIM": "m",  # Onshape uses M (not T) for trim
+    "EXTEND": "x",
+    "OFFSET": "o",
+    "SPLIT": "x",  # no default; X (extend) as fallback
+    "TOGGLE_CONSTRUCTION": "q",  # "Construction"
+    "CONSTRUCTION": "q",
+    "HORIZONTAL": "h",
+    "VERTICAL": "v",
+    "EQUAL": "e",
+    "PARALLEL": "b",
+    "TANGENT": "t",
+    "COINCIDENT": "i",
+    "PERPENDICULAR": "shift+l",
+    "MIDPOINT": "shift+m",
+    "TEXT_RECTANGLE_TWO_CORNERS": "shift+t",  # "Text"
+    "USE": "u",  # "Use / project" (Onshape default: U)
+    "FILLET": "shift+f",  # Sketch fillet (Onshape default: Shift+F)
     # Confirmed Onshape shortcuts for tools with no single-letter default
-    "RECTANGLE_ALIGNED":        "shift+alt+r", # Aligned rectangle
-    "CIRCLE_PERIMETER":         "alt+k",       # 3-point circle
-    "SLOT":                     "j",           # Slot
-    "SKETCHMIRROR":             "alt+i",       # Mirror
-    "SKETCHLPATTERN":           "alt+q",       # Linear pattern
-    "SKETCHCPATTERN":           "alt+g",       # Circular pattern
-    "SPLINE":                   "alt+v",       # Spline
-    "ELLIPSE":                  "shift+b",     # Ellipse
-
+    "RECTANGLE_ALIGNED": "shift+alt+r",  # Aligned rectangle
+    "CIRCLE_PERIMETER": "alt+k",  # 3-point circle
+    "SLOT": "j",  # Slot
+    "SKETCHMIRROR": "alt+i",  # Mirror
+    "SKETCHLPATTERN": "alt+q",  # Linear pattern
+    "SKETCHCPATTERN": "alt+g",  # Circular pattern
+    "SPLINE": "alt+v",  # Spline
+    "ELLIPSE": "shift+b",  # Ellipse
     # ── Assembly ─────────────────────────────────────────────────────────
-    "insertPart":       "i",
-    "fastenMate":       "m",
-
+    "insertPart": "i",
+    "fastenMate": "m",
     # ── General ──────────────────────────────────────────────────────────
-    "fit":              "f",
-    "zoomIn":           "shift+z",
-    "zoomOut":          "z",
+    "fit": "f",
+    "zoomIn": "shift+z",
+    "zoomOut": "z",
 }
 
 # Load user-defined overrides / additions
@@ -127,6 +125,7 @@ def _get_uinput():
         return _uinput
     try:
         from evdev import UInput
+
         _uinput = UInput(name="spacenav-ws-kbd")
         logging.info("keyboard: uinput virtual keyboard created (/dev/uinput)")
         return _uinput
@@ -157,6 +156,7 @@ def _get_uinput():
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def inject_shortcut(command_id: str) -> bool:
     """Inject the keyboard shortcut for an Onshape command ID.
 
@@ -166,9 +166,7 @@ def inject_shortcut(command_id: str) -> bool:
     leaf = command_id.split("-", 1)[-1] if "-" in command_id else command_id
     shortcut = SHORTCUTS.get(command_id) or SHORTCUTS.get(leaf)
     if shortcut is None:
-        logging.warning(
-            "keyboard: no shortcut for %r — add it to %s", command_id, _SHORTCUTS_CONFIG
-        )
+        logging.warning("keyboard: no shortcut for %r — add it to %s", command_id, _SHORTCUTS_CONFIG)
         return False
     return _send_keys(shortcut, command_id)
 
@@ -189,11 +187,11 @@ def _send_keys(shortcut: str, label: str = "") -> bool:
     keys: list[int] = []
 
     mod_map = {
-        "shift":   E.KEY_LEFTSHIFT,
-        "ctrl":    E.KEY_LEFTCTRL,
+        "shift": E.KEY_LEFTSHIFT,
+        "ctrl": E.KEY_LEFTCTRL,
         "control": E.KEY_LEFTCTRL,
-        "alt":     E.KEY_LEFTALT,
-        "meta":    E.KEY_LEFTMETA,
+        "alt": E.KEY_LEFTALT,
+        "meta": E.KEY_LEFTMETA,
     }
 
     for part in parts:

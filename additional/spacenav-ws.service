@@ -1,0 +1,22 @@
+[Unit]
+Description=SpaceMouse WebSocket Bridge for Onshape
+Documentation=https://github.com/rmstorm/spacenav-ws
+# Wait for the spacenavd socket to be available before starting
+After=network.target
+Wants=spacenavd.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+
+# --- PyPI / uvx install (default) ---
+# Runs the latest published release directly without cloning:
+ExecStart=%h/.local/bin/uvx spacenav-ws serve
+
+# --- Local development install ---
+# Uncomment and adjust the path if running from a local clone:
+# ExecStart=%h/.local/bin/uv run --project %h/Dokumente/code/spacenav-ws spacenav-ws serve
+
+[Install]
+WantedBy=default.target

@@ -14,17 +14,19 @@ for _k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS
     if _k in os.environ:
         _X11_ENV[_k] = os.environ[_k]
 
-import numpy as np
-from scipy.spatial import transform
+import numpy as np  # noqa: E402
 
-from spacenav_ws.spacenav import MotionEvent, ButtonEvent, from_message
-from spacenav_ws.wamp import WampSession, Prefix, Call, Subscribe, CallResult
-from spacenav_ws.views import get_view_matrix
-from spacenav_ws.buttons import (
-    get_button_map, get_shift_map, get_hotkeys, SHIFT_BUTTON_ID
+from spacenav_ws.spacenav import MotionEvent, ButtonEvent, from_message  # noqa: E402
+from spacenav_ws.wamp import WampSession, Prefix, Call, Subscribe, CallResult  # noqa: E402
+from spacenav_ws.views import get_view_matrix  # noqa: E402
+from spacenav_ws.buttons import (  # noqa: E402
+    get_button_map,
+    get_shift_map,
+    get_hotkeys,
+    load_config,
+    SHIFT_BUTTON_ID,
 )
-from spacenav_ws.display import EnterpriseDisplay
-import spacenav_ws.cursor_state as cursor_state
+from spacenav_ws.display import EnterpriseDisplay, set_lock_led  # noqa: E402
 
 # Single display instance shared across all connections — USB interface is
 # claimed once at startup and kept open for the lifetime of the process.
@@ -50,6 +52,22 @@ def _persist_saved_views(views: dict[int, dict]):
         _SAVED_VIEWS_PATH.write_text(json.dumps({str(k): v for k, v in views.items()}, indent=2))
     except Exception:
         logging.warning("Could not persist saved views to %s", _SAVED_VIEWS_PATH)
+
+
+def _rotation_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rodrigues rotation formula — returns a 3×3 rotation matrix.
+
+    More numerically correct than decomposed Euler angles: simultaneous
+    multi-axis input is handled as a single rotation, not three sequential ones.
+    """
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-12 or abs(angle) < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    u = axis / norm
+    x, y, z = u
+    skew = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    s, c = np.sin(angle), np.cos(angle)
+    return np.eye(3) + s * skew + (1.0 - c) * (skew @ skew)
 
 
 class Mouse3d:
@@ -99,6 +117,7 @@ class Controller:
         self.lock_rotation = False
         self.shift_held = False
         self._auto_lock_active: bool = False  # True when lock was applied automatically by context
+        set_lock_led(False)  # reset LED to match initial lock_rotation state
 
         self.button_map: dict[int, str] = get_button_map()
         self.shift_map: dict[int, str] = get_shift_map()
@@ -109,6 +128,7 @@ class Controller:
         self._cached_model_extents: list | None = None
         self._cached_perspective: bool | None = None
         self._cached_extents: list | None = None
+        self._cached_frustum: list | None = None
         self._cache_time: float = 0.0
 
         # Pivot lock: world-space pivot is computed once at gesture start and held
@@ -116,16 +136,41 @@ class Controller:
         # view matrix changes frame-to-frame).
         self._locked_pivot: np.ndarray | None = None
         self._last_motion_time: float = 0.0
-        self._GESTURE_GAP_S: float = 0.15   # seconds of silence = new gesture
+        self._GESTURE_GAP_S: float = 0.15  # seconds of silence = new gesture
+
+        # Workaround for spacenavd bug #78: Enterprise releases all buttons when a
+        # keyboard key is pressed simultaneously. Track last key-inject time so we
+        # can suppress a spurious Shift-release that arrives right after an inject.
+        self._last_key_inject_time: float = 0.0
+
+        # Cached viewport aspect ratio (width/height), updated by _fit_affine.
+        # Used as fallback when view.extents is not yet available.
+        self._viewport_ar: float = 16.0 / 9.0
+
+        # Cursor NDC position received from the /cursor WebSocket.
+        # Active once the userscript connects; used for cursor-based pivot.
+        self._cursor_ndc: list[float] = [0.0, 0.0]
+        self._cursor_active: bool = False
+        self._cursor_debug_pivot: list[float] = [0.0, 0.0, 0.0]
+        self._cursor_debug_dist: float = 0.0
+        self._cursor_debug_viewport_half: float = 0.0
+        self._cursor_debug_used_cursor: bool = False
+
+        # Onshape-level motion sensitivity multipliers (config.json → "motion").
+        # These scale on top of the baseline constants; 1.0 = unchanged behaviour.
+        _mc = load_config().get("motion", {})
+        self._rotation_scale: float = float(_mc.get("rotation_scale", 1.0))
+        self._translation_scale: float = float(_mc.get("translation_scale", 1.0))
+        self._zoom_scale: float = float(_mc.get("zoom_scale", 1.0))
 
         # Context-aware commands sent by Onshape via client_update
         self._active_set: str = ""
         self._context_commands: dict[str, list[dict]] = {}  # activeSet -> [{id, label}, ...]
-        self._svg_cache: dict[str, bytes] = {}              # command id -> raw SVG bytes
-        self._last_display_key: tuple = ()                  # debounce display updates
+        self._svg_cache: dict[str, bytes] = {}  # command id -> raw SVG bytes
+        self._last_display_key: tuple = ()  # debounce display updates
 
         self.display = _display
-        self.display.show_hotkeys(self.hotkeys)
+        self._restore_context_display()
 
     async def subscribe(self, msg: Subscribe):
         logging.info("handling subscribe %s", msg)
@@ -144,6 +189,7 @@ class Controller:
 
         if (imgs := args.get("images")) is not None:
             import base64
+
             updated_ids = set()
             for entry in imgs:
                 cmd_id = entry.get("id", "")
@@ -180,18 +226,21 @@ class Controller:
             # Update display only when context commands actually change
             display_cmds = self._context_commands.get(active_set, [])
             display_key = (active_set, tuple(c["id"] for c in display_cmds[:12]))
-            logging.info("display update check: active=%r cmds=%d key_changed=%s",
-                         active_set, len(display_cmds), display_key != self._last_display_key)
+            logging.info(
+                "display update check: active=%r cmds=%d key_changed=%s", active_set, len(display_cmds), display_key != self._last_display_key
+            )
             if display_key != self._last_display_key:
                 self._last_display_key = display_key
                 loop = asyncio.get_event_loop()
                 if display_cmds:
                     hotkeys = self._commands_to_hotkeys(display_cmds[:12])
+
                     def _do_show(hk=hotkeys):
                         try:
                             self.display.show_hotkeys(hk)
                         except Exception as exc:
                             logging.warning("show_hotkeys failed: %s", exc)
+
                     loop.run_in_executor(None, _do_show)
                 else:
                     loop.run_in_executor(None, self.display.show_hotkeys, self.hotkeys)
@@ -208,10 +257,16 @@ class Controller:
 
     async def _refresh_cache(self):
         """Fetch slow-changing state from the client concurrently."""
-        self._cached_model_extents, self._cached_perspective, self._cached_extents = await asyncio.gather(
+        (
+            self._cached_model_extents,
+            self._cached_perspective,
+            self._cached_extents,
+            self._cached_frustum,
+        ) = await asyncio.gather(
             self.remote_read("model.extents"),
             self.remote_read("view.perspective"),
             self.remote_read("view.extents"),
+            self.remote_read("view.frustum"),
         )
         self._cache_time = time.monotonic()
 
@@ -223,12 +278,14 @@ class Controller:
     def _flatten_commands(cat_node: dict) -> list[dict]:
         """Return all leaf commands (type 2) from a single category node."""
         result = []
+
         def walk(nodes):
             for node in nodes:
                 if node.get("type") == 2:
                     result.append({"id": node["id"], "label": node.get("label", "")})
                 if "nodes" in node:
                     walk(node["nodes"])
+
         walk(cat_node.get("nodes", []))
         return result
 
@@ -257,13 +314,10 @@ class Controller:
                 del self.reader._buffer[:32]
             nums = struct.unpack("iiiiiiii", mouse_event)
             event = from_message(list(nums))
-            if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
+            try:
                 await self.update_client(event)
-            else:
-                logging.warning(
-                    "Unknown client! Cannot send mouse events, client_metadata:%s",
-                    self.client_metadata,
-                )
+            except Exception:
+                logging.exception("Error handling mouse event — continuing")
 
     # ------------------------------------------------------------------ #
     #  Top-level event router                                             #
@@ -276,8 +330,14 @@ class Controller:
         await self._handle_motion(event)
 
     async def _handle_button_event(self, event: ButtonEvent):
-        # Track Shift modifier on both press and release
+        # Track Shift modifier on both press and release.
+        # Guard against spacenavd bug #78: on SpaceMouse Enterprise, pressing a
+        # keyboard modifier key (Ctrl/Alt) causes all device buttons to be spuriously
+        # released. If a key-inject happened within 150 ms, ignore the Shift release.
         if event.button_id == SHIFT_BUTTON_ID:
+            if not event.pressed and (time.monotonic() - self._last_key_inject_time) < 0.15:
+                logging.debug("Shift release suppressed (key inject within 150 ms)")
+                return
             self.shift_held = event.pressed
             return
 
@@ -320,7 +380,8 @@ class Controller:
 
         elif action == "toggle_lock_rotation":
             self.lock_rotation = not self.lock_rotation
-            self._auto_lock_active = False   # user took manual control
+            self._auto_lock_active = False  # user took manual control
+            set_lock_led(self.lock_rotation)
             msg = "LOCK ON" if self.lock_rotation else "LOCK OFF"
             logging.info(msg)
             self.display.show_message(msg)
@@ -335,6 +396,11 @@ class Controller:
         elif action == "roll_view":
             await self._action_roll_view()
 
+        elif action == "rotate_view_cw":
+            await self._action_rotate_view(clockwise=True)
+        elif action == "rotate_view_ccw":
+            await self._action_rotate_view(clockwise=False)
+
         elif action.startswith("recall_view_"):
             slot = int(action[-1])
             await self._action_recall_view(slot)
@@ -344,6 +410,7 @@ class Controller:
             await self._action_save_view(slot)
 
         elif action.startswith("key_"):
+            self._last_key_inject_time = time.monotonic()
             self._inject_key(action[4:])
 
         elif action.startswith("hotkey_"):
@@ -381,34 +448,78 @@ class Controller:
             logging.warning("Unknown view: %r", view_name)
             return
         model_extents = await self.remote_read("model.extents")
+        curr_extents = await self.remote_read("view.extents")
         perspective = await self.remote_read("view.perspective")
+        try:
+            await self.remote_write("view.perspective", False)
+        except Exception:
+            pass
+
+        A = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+        R = A[:3, :3]
+        mn = np.array(model_extents[:3], dtype=np.float64)
+        mx = np.array(model_extents[3:], dtype=np.float64)
+
+        # Centre the view on the model by shifting the camera pan offset.
+        center = (mn + mx) / 2.0
+        cam_ctr = center @ R  # model centre in camera space
+        A[3, :3] = -cam_ctr  # pan so model centre = viewport origin
+
+        # Compute orthographic half-extents that fit the model.
+        if curr_extents and curr_extents[3] > 1e-9 and curr_extents[4] > 1e-9:
+            viewport_ar = curr_extents[3] / curr_extents[4]
+        else:
+            viewport_ar = self._viewport_ar
+        corners = np.array(
+            [
+                [mn[0], mn[1], mn[2]],
+                [mx[0], mn[1], mn[2]],
+                [mn[0], mx[1], mn[2]],
+                [mx[0], mx[1], mn[2]],
+                [mn[0], mn[1], mx[2]],
+                [mx[0], mn[1], mx[2]],
+                [mn[0], mx[1], mx[2]],
+                [mx[0], mx[1], mx[2]],
+            ],
+            dtype=np.float64,
+        )
+        cam = corners @ R
+        lo, hi = cam.min(0), cam.max(0)
+        hx = (hi[0] - lo[0]) / 2.0 * 1.05
+        hy = (hi[1] - lo[1]) / 2.0 * 1.05
+        hz = (hi[2] - lo[2]) / 2.0 * 1.05
+        if hy < 1e-12:
+            hy = hx / viewport_ar
+        if hx / hy >= viewport_ar:
+            ext_x, ext_y = hx, hx / viewport_ar
+        else:
+            ext_x, ext_y = hy * viewport_ar, hy
+        extents = [-ext_x, -ext_y, -hz, ext_x, ext_y, hz]
+
         await self.remote_write("motion", True)
-        await self.remote_write("view.affine", matrix)
+        await self.remote_write("view.affine", A.reshape(-1).tolist())
         if not perspective:
-            await self.remote_write("view.extents", model_extents)
+            await self.remote_write("view.extents", extents)
         await self.remote_write("motion", False)
         self.display.show_message(view_name.upper())
         await asyncio.sleep(0.8)
-        self.display.show_hotkeys(self.hotkeys)
+        self._restore_context_display()
 
     async def _action_fit(self):
-        model_extents = await self.remote_read("model.extents")
         curr_affine = await self.remote_read("view.affine")
+        A = np.asarray(curr_affine, dtype=np.float64).reshape(4, 4)
+        await self._fit_affine(A)
+
+    async def _fit_affine(self, A: np.ndarray):
+        """Reposition and scale affine A to fit the model, then apply it."""
+        model_extents = await self.remote_read("model.extents")
         perspective = await self.remote_read("view.perspective")
         curr_extents = await self.remote_read("view.extents")
-        # Infer viewport aspect ratio (width/height) from the current extents.
-        # Onshape always stores extents with ext_x / ext_y == viewport AR.
-        if curr_extents and curr_extents[3] > 1e-9 and curr_extents[4] > 1e-9:
-            viewport_ar = curr_extents[3] / curr_extents[4]
-            self._viewport_ar = viewport_ar   # cache for next time
-        else:
-            viewport_ar = getattr(self, "_viewport_ar", 16.0 / 9.0)
 
         mn = np.array(model_extents[0:3], dtype=np.float64)
         mx = np.array(model_extents[3:6], dtype=np.float64)
         center = (mn + mx) / 2.0
-        A = np.asarray(curr_affine, dtype=np.float64).reshape(4, 4)
-        R = A[:3, :3]   # rows = camera axes in world space
+        R = A[:3, :3]  # rows = camera axes in world space
 
         if perspective:
             radius = np.linalg.norm(mx - mn) * 0.5
@@ -417,18 +528,34 @@ class Controller:
             cam_pos = center + cam_z_world * dist
             new_affine = np.array(A)
             new_affine[3, :3] = cam_pos
-            await self.remote_write("motion", True)
-            await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
-            await self.remote_write("motion", False)
+            await asyncio.gather(
+                self.remote_write("motion", True),
+                self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+            )
             return
 
-        # Project 8 model corners into camera space using the current affine.
-        corners = np.array([
-            [mn[0], mn[1], mn[2]], [mx[0], mn[1], mn[2]],
-            [mn[0], mx[1], mn[2]], [mx[0], mx[1], mn[2]],
-            [mn[0], mn[1], mx[2]], [mx[0], mn[1], mx[2]],
-            [mn[0], mx[1], mx[2]], [mx[0], mx[1], mx[2]],
-        ], dtype=np.float64)
+        # Infer viewport aspect ratio (width/height) from the current extents.
+        # Onshape always stores extents with ext_x / ext_y == viewport AR.
+        if curr_extents and curr_extents[3] > 1e-9 and curr_extents[4] > 1e-9:
+            viewport_ar = curr_extents[3] / curr_extents[4]
+            self._viewport_ar = viewport_ar  # cache for next time
+        else:
+            viewport_ar = self._viewport_ar
+
+        # Project 8 model corners into camera space using A.
+        corners = np.array(
+            [
+                [mn[0], mn[1], mn[2]],
+                [mx[0], mn[1], mn[2]],
+                [mn[0], mx[1], mn[2]],
+                [mx[0], mx[1], mn[2]],
+                [mn[0], mn[1], mx[2]],
+                [mx[0], mn[1], mx[2]],
+                [mn[0], mx[1], mx[2]],
+                [mx[0], mx[1], mx[2]],
+            ],
+            dtype=np.float64,
+        )
         cam = corners @ R + A[3, :3]
 
         # Compute the camera-space bounding box of the model and its centre.
@@ -464,21 +591,22 @@ class Controller:
         extents = [-ext_x, -ext_y, -ext_z, ext_x, ext_y, ext_z]
 
         logging.info("fit AR=%.3f ext_xy=[%.4f, %.4f]", viewport_ar, ext_x, ext_y)
-        await self.remote_write("motion", True)
-        await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
-        await self.remote_write("view.extents", extents)
-        await self.remote_write("motion", False)
+        await asyncio.gather(
+            self.remote_write("motion", True),
+            self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+            self.remote_write("view.extents", extents),
+        )
 
     async def _action_zoom(self, scale: float):
         perspective = await self.remote_read("view.perspective")
-        await self.remote_write("motion", True)
         if not perspective:
             extents = await self.remote_read("view.extents")
-            await self.remote_write("view.extents", [c * scale for c in extents])
+            await asyncio.gather(
+                self.remote_write("motion", True),
+                self.remote_write("view.extents", [c * scale for c in extents]),
+            )
         else:
-            curr_affine = np.asarray(
-                await self.remote_read("view.affine"), dtype=np.float64
-            ).reshape(4, 4)
+            curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float64).reshape(4, 4)
             R = curr_affine[:3, :3].T
             cam_z = R[:, 2]
             model_extents = await self.remote_read("model.extents")
@@ -487,33 +615,84 @@ class Controller:
             trans = np.eye(4, dtype=np.float64)
             trans[3, :3] = cam_z * step
             new_affine = trans @ curr_affine
-            await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
-        await self.remote_write("motion", False)
+            await asyncio.gather(
+                self.remote_write("motion", True),
+                self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+            )
 
     async def _action_roll_view(self):
-        curr_affine = np.asarray(
-            await self.remote_read("view.affine"), dtype=np.float64
-        ).reshape(4, 4)
+        curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float64).reshape(4, 4)
         R = curr_affine[:3, :3].T
         look = -R[:, 2]
-        world_up = np.array([0.0, 1.0, 0.0])
-        right = np.cross(world_up, look)
-        if np.linalg.norm(right) < 1e-6:
-            world_up = np.array([0.0, 0.0, 1.0])
-            right = np.cross(world_up, look)
+        world_up = np.array([0.0, 0.0, 1.0])  # Onshape is Z-up
+        right = np.cross(look, world_up)
+        if np.linalg.norm(right) < 1e-6:  # look ∥ Z — fall back to Y
+            world_up = np.array([0.0, 1.0, 0.0])
+            right = np.cross(look, world_up)
         right /= np.linalg.norm(right)
-        up = np.cross(look, right)
+        up = np.cross(right, look)
+        up /= np.linalg.norm(up)
         R_new = np.stack([right, up, -look], axis=1)
         new_affine = np.array(curr_affine, dtype=np.float64)
         new_affine[:3, :3] = R_new.T
-        await self.remote_write("motion", True)
-        await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
-        await self.remote_write("motion", False)
+        await asyncio.gather(
+            self.remote_write("motion", True),
+            self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+        )
+
+    async def _action_rotate_view(self, clockwise: bool):
+        """Roll the camera 90° clockwise (CW) or counterclockwise (CCW).
+
+        A CW roll means the image rotates clockwise on screen: the current
+        up-direction moves toward the right.  In terms of the world→camera
+        rotation matrix A[:3,:3] (rows = camera axes in world space):
+          CW:  new_X = old_Y,  new_Y = -old_X   →  R = [[0,1,0],[-1,0,0],[0,0,1]]
+          CCW: new_X = -old_Y, new_Y =  old_X   →  R = [[0,-1,0],[1,0,0],[0,0,1]]
+        In orthographic mode the X/Y extents are swapped so the zoom is preserved.
+        """
+        curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float64).reshape(4, 4)
+        perspective = await self.remote_read("view.perspective")
+
+        if clockwise:
+            R_roll = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        else:
+            R_roll = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+
+        new_affine = np.array(curr_affine)
+        new_affine[:3, :3] = R_roll @ curr_affine[:3, :3]
+
+        if not perspective:
+            extents = await self.remote_read("view.extents")
+            new_extents = [extents[1], extents[0], extents[2], extents[4], extents[3], extents[5]]
+            await asyncio.gather(
+                self.remote_write("motion", True),
+                self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+                self.remote_write("view.extents", new_extents),
+            )
+        else:
+            await asyncio.gather(
+                self.remote_write("motion", True),
+                self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
+            )
 
     async def _action_save_view(self, slot: int):
-        affine = await self.remote_read("view.affine")
-        extents = await self.remote_read("view.extents")
-        perspective = await self.remote_read("view.perspective")
+        try:
+            affine = await self.remote_read("view.affine")
+            extents = await self.remote_read("view.extents")
+            perspective = await self.remote_read("view.perspective")
+        except Exception as exc:
+            logging.warning("save_view_%d: could not read view state — %s", slot, exc)
+            self.display.show_message("ERR SAVE")
+            await asyncio.sleep(0.8)
+            self._restore_context_display()
+            return
+        logging.debug(
+            "save_view_%d: affine=%s extents=%s perspective=%s",
+            slot,
+            affine,
+            extents,
+            perspective,
+        )
         self.saved_views[slot] = {
             "affine": affine,
             "extents": extents,
@@ -524,7 +703,7 @@ class Controller:
         logging.info(msg)
         self.display.show_message(msg)
         await asyncio.sleep(0.8)
-        self.display.show_hotkeys(self.hotkeys)
+        self._restore_context_display()
 
     async def _action_recall_view(self, slot: int):
         view = self.saved_views.get(slot)
@@ -533,18 +712,29 @@ class Controller:
             logging.info("Custom view slot %d is empty", slot)
             self.display.show_message(msg)
             await asyncio.sleep(0.8)
-            self.display.show_hotkeys(self.hotkeys)
+            self._restore_context_display()
             return
-        await self.remote_write("motion", True)
-        await self.remote_write("view.affine", view["affine"])
-        await self.remote_write("view.perspective", view["perspective"])
-        if not view["perspective"]:
-            await self.remote_write("view.extents", view["extents"])
-        await self.remote_write("motion", False)
+        logging.debug(
+            "recall_view_%d: writing affine=%s extents=%s perspective=%s",
+            slot,
+            view["affine"],
+            view.get("extents"),
+            view.get("perspective"),
+        )
+        try:
+            writes = [
+                self.remote_write("motion", True),
+                self.remote_write("view.affine", view["affine"]),
+            ]
+            if not view["perspective"] and view.get("extents") is not None:
+                writes.append(self.remote_write("view.extents", view["extents"]))
+            await asyncio.gather(*writes)
+        except Exception as exc:
+            logging.warning("recall_view_%d failed — %s", slot, exc)
         msg = f"VIEW V{slot}"
         self.display.show_message(msg)
         await asyncio.sleep(0.8)
-        self.display.show_hotkeys(self.hotkeys)
+        self._restore_context_display()
 
     async def _invoke_onshape_command(self, command_id: str):
         """Ask Onshape to execute a command by ID (e.g. 'Part Studio-extrude').
@@ -561,36 +751,38 @@ class Controller:
         wamp_candidates = [
             ("activeCommand", command_id),
             ("activeCommand", leaf_id),
-            ("command",       leaf_id),   # original attempt, but with leaf only
+            ("command", leaf_id),  # original attempt, but with leaf only
         ]
         for prop, value in wamp_candidates:
             try:
                 await self.wamp_state_handler.client_rpc(
-                    self.controller_uri, "self:update", prop, value,
+                    self.controller_uri,
+                    "self:update",
+                    prop,
+                    value,
                     timeout=1.5,
                 )
                 logging.info("Command invoked via self:update/%s=%r", prop, value)
                 return
             except asyncio.TimeoutError:
                 logging.warning("WAMP self:update/%s=%r → timeout", prop, value)
-                break   # no point retrying further if Onshape didn't respond at all
+                break  # no point retrying further if Onshape didn't respond at all
             except ValueError as exc:
                 logging.warning("WAMP self:update/%s=%r → %s", prop, value, exc)
 
         # Keyboard fallback
         from spacenav_ws.keyboard import inject_shortcut
+
         if inject_shortcut(command_id):
             return
         logging.warning(
-            "No working invocation for command %r.\n"
-            "  Add a keyboard shortcut to ~/.config/spacenav-ws/shortcuts.json:\n"
-            '    {"%s": "shift+x"}',
-            command_id, command_id,
+            'No working invocation for command %r.\n  Add a keyboard shortcut to ~/.config/spacenav-ws/shortcuts.json:\n    {"%s": "shift+x"}',
+            command_id,
+            command_id,
         )
 
     async def _signal_motion(self):
         await self.remote_write("motion", True)
-        await self.remote_write("motion", False)
 
     # ------------------------------------------------------------------ #
     #  Context-lock helpers                                               #
@@ -603,11 +795,13 @@ class Controller:
         if new_set in self._2D_CONTEXTS and not self._auto_lock_active:
             self.lock_rotation = True
             self._auto_lock_active = True
+            set_lock_led(True)
             logging.info("Auto-lock ON  (%s)", new_set)
             asyncio.create_task(self._context_notification(new_set))
         elif new_set not in self._2D_CONTEXTS and self._auto_lock_active:
             self.lock_rotation = False
             self._auto_lock_active = False
+            set_lock_led(False)
             logging.info("Auto-lock OFF (%s → %s)", old_set, new_set)
 
     async def _context_notification(self, context: str) -> None:
@@ -634,20 +828,29 @@ class Controller:
     def _inject_key(key_name: str) -> None:
         """Inject a single key press.  Uses uinput (Wayland-compatible) first."""
         from spacenav_ws.keyboard import _send_keys
+
         if _send_keys(key_name):
             return
         # xdotool fallback (X11 only)
         xkey_map = {
-            "esc": "Escape", "enter": "Return", "delete": "Delete",
-            "tab": "Tab", "space": "space",
-            "alt": "alt", "shift": "shift", "ctrl": "ctrl",
+            "esc": "Escape",
+            "enter": "Return",
+            "delete": "Delete",
+            "tab": "Tab",
+            "space": "space",
+            "alt": "alt",
+            "shift": "shift",
+            "ctrl": "ctrl",
         }
         xkey = xkey_map.get(key_name, key_name)
         env = {**os.environ, **_X11_ENV}
         try:
             result = subprocess.run(
                 ["xdotool", "key", "--clearmodifiers", xkey],
-                check=False, capture_output=True, timeout=0.5, env=env,
+                check=False,
+                capture_output=True,
+                timeout=0.5,
+                env=env,
             )
             if result.returncode != 0:
                 logging.warning("xdotool key %r failed: %s", xkey, result.stderr.decode().strip())
@@ -669,20 +872,20 @@ class Controller:
         perspective = self._cached_perspective
         extents = self._cached_extents
 
-        curr_affine = np.asarray(
-            await self.remote_read("view.affine"), dtype=np.float32
-        ).reshape(4, 4)
+        curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float32).reshape(4, 4)
 
         R_cam = curr_affine[:3, :3].T
         U, _, Vt = np.linalg.svd(R_cam)
         R_cam = U @ Vt
 
         pitch = 0.0 if self.lock_rotation else event.pitch
-        yaw   = 0.0 if self.lock_rotation else event.yaw
-        roll  = 0.0 if self.lock_rotation else event.roll
+        yaw = 0.0 if self.lock_rotation else event.yaw
+        roll = 0.0 if self.lock_rotation else event.roll
 
-        angles = np.array([pitch, yaw, -roll]) * 0.01
-        R_delta_cam = transform.Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
+        # Rodrigues axis-angle rotation — handles simultaneous multi-axis input
+        # as a single rotation (no Euler-order artefacts, no scipy needed).
+        ang_cam = np.array([pitch, yaw, -roll], dtype=np.float64) * (0.01 * np.pi / 180.0 * self._rotation_scale)
+        R_delta_cam = _rotation_from_axis_angle(ang_cam, float(np.linalg.norm(ang_cam)))
         R_world = R_cam @ R_delta_cam @ R_cam.T
 
         rot_delta = np.eye(4, dtype=np.float32)
@@ -697,40 +900,87 @@ class Controller:
         self._last_motion_time = now
 
         if new_gesture or self._locked_pivot is None:
-            if cursor_state.active:
-                nx, ny = cursor_state.ndc
+            # Priority 1: ask Onshape for its native pivot (most reliable).
+            # Priority 2: cursor NDC projection (ortho only — extents needed).
+            # Priority 3: model bounding-box centre (always available).
+            pivot_raw = None
+            try:
+                pivot_raw = await self.remote_read("pivot.position")
+            except Exception:
+                pass
+            if isinstance(pivot_raw, list) and len(pivot_raw) >= 3:
+                self._locked_pivot = np.array(pivot_raw[:3], dtype=np.float64)
+                self._cursor_debug_used_cursor = False
+            elif self._cursor_active and not perspective:
+                nx, ny = self._cursor_ndc
                 self._locked_pivot = self._cursor_pivot(nx, ny, model_extents, curr_affine, extents)
             else:
-                min_pt = np.array(model_extents[:3], dtype=np.float32)
-                max_pt = np.array(model_extents[3:6], dtype=np.float32)
+                min_pt = np.array(model_extents[:3], dtype=np.float64)
+                max_pt = np.array(model_extents[3:6], dtype=np.float64)
                 self._locked_pivot = (min_pt + max_pt) * 0.5
-            logging.warning("pivot lock: active=%s ndc=(%.2f,%.2f) p=[%.3f,%.3f,%.3f]",
-                            cursor_state.active, *cursor_state.ndc, *self._locked_pivot)
+            self._cursor_debug_pivot[:] = self._locked_pivot.tolist()
+            logging.debug(
+                "pivot lock: native=%s active=%s ndc=(%.2f,%.2f) p=[%.3f,%.3f,%.3f] cursor_dist=%.3f vh=%.3f used_cursor=%s",
+                pivot_raw is not None,
+                self._cursor_active,
+                *self._cursor_ndc,
+                *self._locked_pivot,
+                self._cursor_debug_dist,
+                self._cursor_debug_viewport_half,
+                self._cursor_debug_used_cursor,
+            )
 
         pivot = self._locked_pivot
         pivot_pos, pivot_neg = self._get_affine_pivot_matrices(pivot)
         new_affine = curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
 
-        extent_scale = sum(extents[3:6]) / 3.0 if extents else 1.0
-        cam_trans = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.000375 * extent_scale
-        new_affine[3, :3] += R_cam @ cam_trans
+        # Frustum-proportional pan scaling (PR #5):
+        # Perspective: use frustum spans at pivot depth so panning maps 1:1 to screen.
+        # Orthographic: use view XY spans from cached extents.
+        eye = curr_affine[3, :3].astype(np.float64)
+        fwd = (-R_cam[:, 2]).astype(np.float64)
+        depth = max(float(abs(np.dot(fwd, pivot.astype(np.float64) - eye))), 1e-3)
+
+        if perspective and self._cached_frustum and len(self._cached_frustum) >= 6:
+            fl, fr, fb, ft, fn, _ = self._cached_frustum
+            near = max(abs(float(fn)), 1e-9)
+            span_x = max((float(fr) - float(fl)) * depth / near, 1e-9)
+            span_y = max((float(ft) - float(fb)) * depth / near, 1e-9)
+        elif not perspective and extents and len(extents) >= 5:
+            span_x = max(extents[3] - extents[0], 1e-9)
+            span_y = max(extents[4] - extents[1], 1e-9)
+        else:
+            span_x = span_y = depth  # fallback
+
+        _PAN_RATE = 3.0 / 350.0 * self._translation_scale  # view-spans per second per max-count (matches PR #5)
+        cam_trans = (
+            np.array(
+                [-event.x * span_x, -event.z * span_y, event.y * depth / 6.0],
+                dtype=np.float64,
+            )
+            * _PAN_RATE
+        )
+        new_affine[3, :3] += (R_cam @ cam_trans).astype(np.float32)
 
         writes = [
             self.remote_write("motion", True),
             self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
         ]
-        if not perspective:
-            scale = 1.0 + event.y * 0.0001
-            new_extents = [c * scale for c in extents]
+        if not perspective and extents and len(extents) >= 6:
+            # Zoom: Onshape's base-2 law (scale = 2^(-delta/6)); center-preserving.
+            # Only XY extents scale — near/far (indices 2 & 5) are left unchanged.
+            _ZOOM_RATE = 20.0 / np.log(2.0) / 350.0 * self._zoom_scale
+            zoom_scale = 2.0 ** (-event.y * _ZOOM_RATE / 6.0)
+            cx = (extents[0] + extents[3]) * 0.5
+            cy = (extents[1] + extents[4]) * 0.5
+            hx = (extents[3] - extents[0]) * 0.5 * zoom_scale
+            hy = (extents[4] - extents[1]) * 0.5 * zoom_scale
+            new_extents = [cx - hx, cy - hy, extents[2], cx + hx, cy + hy, extents[5]]
             writes.append(self.remote_write("view.extents", new_extents))
             self._cached_extents = new_extents  # keep cache in sync
         await asyncio.gather(*writes)
 
-    @staticmethod
-    def _cursor_pivot(nx: float, ny: float,
-                      model_extents: list,
-                      curr_affine: np.ndarray,
-                      extents: list | None) -> np.ndarray:
+    def _cursor_pivot(self, nx: float, ny: float, model_extents: list, curr_affine: np.ndarray, extents: list | None) -> np.ndarray:
         """Project the screen-space cursor to model-centre depth to get a pivot.
 
         This places the rotation pivot at the world-space point directly under
@@ -748,35 +998,42 @@ class Controller:
             return model_center
 
         A = curr_affine.astype(np.float64)
-        R     = A[:3, :3]   # world→camera rotation  (row vectors are camera axes)
-        R_cam = R.T         # camera→world rotation
-        t     = A[3, :3]   # view translation
+        R = A[:3, :3]  # world→camera rotation  (row vectors are camera axes)
+        R_cam = R.T  # camera→world rotation
+        t = A[3, :3]  # view translation
 
         # Camera-space half-extents (handles asymmetric / panned views).
         cx_center = (extents[0] + extents[3]) * 0.5
         cy_center = (extents[1] + extents[4]) * 0.5
-        cx_half   = (extents[3] - extents[0]) * 0.5
-        cy_half   = (extents[4] - extents[1]) * 0.5
+        cx_half = (extents[3] - extents[0]) * 0.5
+        cy_half = (extents[4] - extents[1]) * 0.5
 
         # Model centre in camera space.
         mc_cam = model_center @ R + t
 
         # Cursor position in camera space at model-centre depth.
-        cursor_cam = np.array([
-            cx_center + nx * cx_half,
-            cy_center + ny * cy_half,
-            mc_cam[2],
-        ])
+        cursor_cam = np.array(
+            [
+                cx_center + nx * cx_half,
+                cy_center + ny * cy_half,
+                mc_cam[2],
+            ]
+        )
 
         # Guard: if the cursor is more than 2× the viewport half-width away from
         # the model centre in camera space, it is almost certainly in a toolbar or
         # side-panel rather than the 3-D viewport.  Fall back to model centre.
-        cursor_dist = np.sqrt((cursor_cam[0] - mc_cam[0])**2 +
-                              (cursor_cam[1] - mc_cam[1])**2)
+        cursor_dist = np.sqrt((cursor_cam[0] - mc_cam[0]) ** 2 + (cursor_cam[1] - mc_cam[1]) ** 2)
         viewport_half = max(cx_half, cy_half)
+
+        self._cursor_debug_dist = float(cursor_dist)
+        self._cursor_debug_viewport_half = float(viewport_half)
+
         if cursor_dist > viewport_half * 2.0:
+            self._cursor_debug_used_cursor = False
             return model_center
 
+        self._cursor_debug_used_cursor = True
         # Transform back to world space: p_world = (p_cam - t) @ R^{-1}
         return (cursor_cam - t) @ R_cam
 
@@ -800,20 +1057,23 @@ async def create_mouse_controller(
         await wamp_state_handler.wamp.run_message_handler(msg)
         msg = await wamp_state_handler.wamp.next_message()
 
-    assert isinstance(msg, Call)
-    assert msg.proc_uri == "3dx_rpc:create" and msg.args[0] == "3dconnexion:3dmouse"
+    if not isinstance(msg, Call) or msg.proc_uri != "3dx_rpc:create" or msg.args[0] != "3dconnexion:3dmouse":
+        raise ValueError(f"WAMP handshake failed: expected 3dmouse create, got {msg!r}")
     mouse = Mouse3d()
     logging.info('Created 3d mouse "%s" for version %s', mouse.id, msg.args[1])
     await wamp_state_handler.wamp.send_message(CallResult(msg.call_id, {"connexion": mouse.id}))
 
     msg = await wamp_state_handler.wamp.next_message()
-    assert isinstance(msg, Call)
-    assert msg.proc_uri == "3dx_rpc:create" and msg.args[0] == "3dconnexion:3dcontroller" and msg.args[1] == mouse.id
+    if not isinstance(msg, Call) or msg.proc_uri != "3dx_rpc:create" or msg.args[0] != "3dconnexion:3dcontroller" or msg.args[1] != mouse.id:
+        raise ValueError(f"WAMP handshake failed: expected 3dcontroller create, got {msg!r}")
     metadata = msg.args[2]
     controller = Controller(spacenav_reader, mouse, wamp_state_handler, metadata)
     logging.info(
         'Created controller "%s" for mouse "%s", client "%s" v%s',
-        controller.id, mouse.id, metadata["name"], metadata["version"],
+        controller.id,
+        mouse.id,
+        metadata["name"],
+        metadata["version"],
     )
     await wamp_state_handler.wamp.send_message(CallResult(msg.call_id, {"instance": controller.id}))
     return controller
