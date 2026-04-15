@@ -9,6 +9,7 @@ from types import CoroutineType
 from typing import Any, ClassVar, Dict, NamedTuple, Optional, Type, Callable
 
 from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect
 
 
 def _rand_id(len) -> str:
@@ -159,6 +160,8 @@ class WampProtocol:
 
     def resolve(self, uri: str) -> str:
         """Resolve any registered prefixes in the uri"""
+        if ":" not in uri:
+            return uri
         prefix, res = uri.split(":", 1)
         return self.prefixes.get(prefix, "") + res
 
@@ -176,7 +179,10 @@ class WampSession:
 
     async def start_wamp_message_stream(self):
         while True:
-            msg = await self.wamp.next_message()
+            try:
+                msg = await self.wamp.next_message()
+            except WebSocketDisconnect:
+                return  # browser closed the tab — clean exit, no error to log
             # They're all like.. interleaved.. have to create one task per message with the current approach.. Not very nice because it means errors don't bubble up
             asyncio.create_task(self.wamp.run_message_handler(msg))
 
@@ -204,11 +210,17 @@ class WampSession:
         return rpc["result"]
 
     async def handle_callresult(self, msg: CallResult):
-        rpc = self.in_flight_rpcs[msg.call_id]
+        rpc = self.in_flight_rpcs.get(msg.call_id)
+        if rpc is None:
+            logging.debug("CallResult for unknown call_id %s — ignoring", msg.call_id)
+            return
         rpc["result"] = msg.result
         rpc["gate"].set()
 
     async def handle_callerror(self, msg: CallError):
-        rpc = self.in_flight_rpcs[msg.call_id]
+        rpc = self.in_flight_rpcs.get(msg.call_id)
+        if rpc is None:
+            logging.debug("CallError for unknown call_id %s — ignoring", msg.call_id)
+            return
         rpc["error"] = (msg.error_uri, msg.desc)
         rpc["gate"].set()

@@ -8,12 +8,14 @@ would produce wrong camera motion in Onshape without any obvious error.
 import math
 
 import numpy as np
-# ---------------------------------------------------------------------------
-# Helpers — import the functions under test directly so the tests remain
-# independent of the Controller class and its hardware dependencies.
-# ---------------------------------------------------------------------------
 
-from spacenav_ws.controller import _rotation_from_axis_angle, Controller
+from spacenav_ws.controller import (
+    CursorPivotResult,
+    _rotation_from_axis_angle,
+    compute_cursor_pivot,
+    Controller,
+)
+from spacenav_ws.spacenav import ButtonEvent, MotionEvent, from_message
 from spacenav_ws.views import VIEW_MATRICES, get_view_matrix
 
 
@@ -75,117 +77,233 @@ class TestRotationFromAxisAngle:
 
 
 # ===========================================================================
-# _cursor_pivot  (needs a Controller instance but no hardware)
+# compute_cursor_pivot  — pure function, no hardware stub needed
 # ===========================================================================
 
-def _make_controller():
-    """Return a Controller with all hardware dependencies stubbed out."""
 
-    class FakeWamp:
-        wamp = type("W", (), {
-            "subscribe_handlers": {},
-            "call_handlers": {},
-        })()
-
-    class FakeReader:
-        pass
-
-    # Patch display so EnterpriseDisplay() doesn't try to open USB.
-    import unittest.mock as mock
-    import spacenav_ws.display as disp_mod
-
-    with mock.patch.object(disp_mod, "EnterpriseDisplay", return_value=mock.MagicMock()):
-        ctrl = Controller.__new__(Controller)
-        # Minimal __init__ without hardware side-effects.
-        ctrl.id = "controller0"
-        ctrl.client_metadata = {}
-        ctrl.reader = FakeReader()
-        ctrl.wamp_state_handler = FakeWamp()
-        ctrl.subscribed = False
-        ctrl.focus = False
-        ctrl.lock_rotation = False
-        ctrl.shift_held = False
-        ctrl._auto_lock_active = False
-        ctrl.button_map = {}
-        ctrl.shift_map = {}
-        ctrl.hotkeys = []
-        ctrl.saved_views = {}
-        ctrl._cached_model_extents = None
-        ctrl._cached_perspective = None
-        ctrl._cached_extents = None
-        ctrl._cached_frustum = None
-        ctrl._cache_time = 0.0
-        ctrl._locked_pivot = None
-        ctrl._last_motion_time = 0.0
-        ctrl._GESTURE_GAP_S = 0.15
-        ctrl._last_key_inject_time = 0.0
-        ctrl._viewport_ar = 16.0 / 9.0
-        ctrl._cursor_ndc = [0.0, 0.0]
-        ctrl._cursor_active = False
-        ctrl._cursor_debug_pivot = [0.0, 0.0, 0.0]
-        ctrl._cursor_debug_dist = 0.0
-        ctrl._cursor_debug_viewport_half = 0.0
-        ctrl._cursor_debug_used_cursor = False
-        ctrl._rotation_scale = 1.0
-        ctrl._translation_scale = 1.0
-        ctrl._zoom_scale = 1.0
-        ctrl._active_set = ""
-        ctrl._context_commands = {}
-        ctrl._svg_cache = {}
-        ctrl._last_display_key = ()
-        ctrl.display = mock.MagicMock()
-    return ctrl
+def _identity_affine():
+    return np.eye(4, dtype=np.float64)
 
 
-class TestCursorPivot:
-    """_cursor_pivot(nx, ny, model_extents, curr_affine, extents)"""
+def _extents(half_x=1.0, half_y=1.0):
+    return [-half_x, -half_y, -10.0, half_x, half_y, 10.0]
 
-    def _identity_affine(self):
-        return np.eye(4, dtype=np.float64)
 
-    def _extents(self, half_x=1.0, half_y=1.0):
-        return [-half_x, -half_y, -10.0, half_x, half_y, 10.0]
+def _model_extents(half=1.0):
+    return [-half, -half, -half, half, half, half]
 
-    def _model_extents(self, half=1.0):
-        return [-half, -half, -half, half, half, half]
+
+class TestComputeCursorPivot:
+    """compute_cursor_pivot is a pure function; no Controller stub required."""
+
+    def test_returns_cursor_pivot_result(self):
+        r = compute_cursor_pivot(0.0, 0.0, _model_extents(), _identity_affine(), _extents())
+        assert isinstance(r, CursorPivotResult)
 
     def test_centre_cursor_returns_model_centre(self):
-        ctrl = _make_controller()
-        result = ctrl._cursor_pivot(0.0, 0.0, self._model_extents(), self._identity_affine(), self._extents())
-        # Model centre is origin; cursor at NDC (0,0) should give model centre
-        np.testing.assert_allclose(result, [0.0, 0.0, 0.0], atol=1e-10)
+        r = compute_cursor_pivot(0.0, 0.0, _model_extents(), _identity_affine(), _extents())
+        np.testing.assert_allclose(r.pivot, [0.0, 0.0, 0.0], atol=1e-10)
 
-    def test_missing_extents_returns_model_centre(self):
-        ctrl = _make_controller()
-        result = ctrl._cursor_pivot(0.5, 0.5, self._model_extents(), self._identity_affine(), None)
-        np.testing.assert_allclose(result, [0.0, 0.0, 0.0], atol=1e-10)
+    def test_missing_extents_uses_bbox_estimate(self):
+        """When view.extents is None the bbox-estimate path is taken.
+
+        With identity affine and a unit cube model the bbox-projected half-extents
+        are 1.0 * 1.5 = 1.5 in both X and Y.  Cursor (0.5, 0.5) → camera-space
+        offset (0.75, 0.75) → result moves away from model centre.
+        """
+        r = compute_cursor_pivot(0.5, 0.5, _model_extents(), _identity_affine(), None)
+        assert r.used_cursor is True
+        assert r.source == "bbox_estimate"
+        np.testing.assert_allclose(r.pivot, [0.75, 0.75, 0.0], atol=1e-6)
 
     def test_far_cursor_falls_back_to_model_centre(self):
-        """NDC far outside viewport (e.g. cursor in a toolbar) → model centre."""
-        ctrl = _make_controller()
-        # NDC (10, 10) is 10× the half-extent away — well beyond the 2× guard
-        result = ctrl._cursor_pivot(10.0, 10.0, self._model_extents(), self._identity_affine(), self._extents())
-        np.testing.assert_allclose(result, [0.0, 0.0, 0.0], atol=1e-10)
-        assert ctrl._cursor_debug_used_cursor is False
+        """NDC far outside viewport (cursor in toolbar) → model centre."""
+        r = compute_cursor_pivot(10.0, 10.0, _model_extents(), _identity_affine(), _extents())
+        np.testing.assert_allclose(r.pivot, [0.0, 0.0, 0.0], atol=1e-10)
+        assert r.used_cursor is False
+        assert r.source == "model_center_oob"
 
     def test_near_cursor_is_used(self):
-        ctrl = _make_controller()
-        ctrl._cursor_pivot(0.3, 0.3, self._model_extents(), self._identity_affine(), self._extents())
-        assert ctrl._cursor_debug_used_cursor is True
+        r = compute_cursor_pivot(0.3, 0.3, _model_extents(), _identity_affine(), _extents())
+        assert r.used_cursor is True
 
-    def test_debug_fields_written(self):
-        ctrl = _make_controller()
-        ctrl._cursor_pivot(0.0, 0.0, self._model_extents(), self._identity_affine(), self._extents())
-        # Fields must be numbers, not zero-default from unexecuted branches
-        assert isinstance(ctrl._cursor_debug_dist, float)
-        assert isinstance(ctrl._cursor_debug_viewport_half, float)
+    def test_debug_fields_are_floats(self):
+        r = compute_cursor_pivot(0.0, 0.0, _model_extents(), _identity_affine(), _extents())
+        assert isinstance(r.dist, float)
+        assert isinstance(r.viewport_half, float)
 
     def test_pivot_moves_with_cursor(self):
         """Pivot X should shift when NDC X shifts (identity affine, symmetric extents)."""
-        ctrl = _make_controller()
-        p0 = ctrl._cursor_pivot(0.0, 0.0, self._model_extents(2.0), self._identity_affine(), self._extents(2.0, 2.0))
-        p1 = ctrl._cursor_pivot(0.5, 0.0, self._model_extents(2.0), self._identity_affine(), self._extents(2.0, 2.0))
-        assert p1[0] > p0[0], "pivot X should increase when NDC X increases"
+        r0 = compute_cursor_pivot(0.0, 0.0, _model_extents(2.0), _identity_affine(), _extents(2.0, 2.0))
+        r1 = compute_cursor_pivot(0.5, 0.0, _model_extents(2.0), _identity_affine(), _extents(2.0, 2.0))
+        assert r1.pivot[0] > r0.pivot[0], "pivot X should increase when NDC X increases"
+
+    def test_source_is_cursor_with_extents(self):
+        r = compute_cursor_pivot(0.3, 0.0, _model_extents(), _identity_affine(), _extents())
+        assert r.source == "cursor"
+
+    def test_viewport_half_equals_max_half_extent(self):
+        """viewport_half must be max(cx_half, cy_half) from extents."""
+        r = compute_cursor_pivot(0.0, 0.0, _model_extents(), _identity_affine(), _extents(half_x=2.0, half_y=1.0))
+        assert math.isclose(r.viewport_half, 2.0, rel_tol=1e-6)
+
+
+# ===========================================================================
+# Controller._get_affine_pivot_matrices  (static method, no stub needed)
+# ===========================================================================
+
+
+class TestGetAffinePivotMatrices:
+    def test_pivot_at_origin_returns_identity_pair(self):
+        pivot_pos, pivot_neg = Controller._get_affine_pivot_matrices(np.zeros(3))
+        np.testing.assert_allclose(pivot_pos, np.eye(4), atol=1e-10)
+        np.testing.assert_allclose(pivot_neg, np.eye(4), atol=1e-10)
+
+    def test_pivot_pos_neg_are_inverses(self):
+        """pivot_pos @ pivot_neg must equal identity."""
+        pivot = np.array([1.0, 2.0, 3.0])
+        pivot_pos, pivot_neg = Controller._get_affine_pivot_matrices(pivot)
+        np.testing.assert_allclose(pivot_pos @ pivot_neg, np.eye(4), atol=1e-6)
+
+    def test_pivot_translation_stored_in_row3(self):
+        pivot = np.array([1.0, 2.0, 3.0])
+        pivot_pos, pivot_neg = Controller._get_affine_pivot_matrices(pivot)
+        np.testing.assert_allclose(pivot_pos[3, :3], pivot, atol=1e-10)
+        np.testing.assert_allclose(pivot_neg[3, :3], -pivot, atol=1e-10)
+
+
+# ===========================================================================
+# spacenav.py — from_message event parsing
+# ===========================================================================
+
+
+class TestFromMessage:
+    def test_motion_event_type_zero(self):
+        msg = [0, 10, -5, 3, 1, 2, -3, 16]
+        event = from_message(msg)
+        assert isinstance(event, MotionEvent)
+        assert event.type == "mtn"
+
+    def test_motion_event_axes_mapped_correctly(self):
+        """from_message maps (type, x, z, y, pitch, yaw, roll, period)."""
+        msg = [0, 1, 2, 3, 4, 5, 6, 16]
+        event = from_message(msg)
+        assert event.x == 1
+        assert event.z == 2   # note: raw index 2 → .z
+        assert event.y == 3   # raw index 3 → .y
+        assert event.pitch == 4
+        assert event.yaw == 5
+        assert event.roll == 6
+        assert event.period == 16
+
+    def test_button_press_type_one(self):
+        msg = [1, 7, 0, 0, 0, 0, 0, 0]
+        event = from_message(msg)
+        assert isinstance(event, ButtonEvent)
+        assert event.button_id == 7
+        assert event.pressed is True
+        assert event.type == "btn"
+
+    def test_button_release_type_two(self):
+        msg = [2, 7, 0, 0, 0, 0, 0, 0]
+        event = from_message(msg)
+        assert isinstance(event, ButtonEvent)
+        assert event.button_id == 7
+        assert event.pressed is False
+
+    def test_motion_zero_all_axes(self):
+        msg = [0, 0, 0, 0, 0, 0, 0, 0]
+        event = from_message(msg)
+        assert isinstance(event, MotionEvent)
+        assert event.x == 0 and event.y == 0 and event.z == 0
+
+    def test_motion_negative_values(self):
+        msg = [0, -100, -200, -300, -400, -500, -600, 32]
+        event = from_message(msg)
+        assert event.x == -100
+        assert event.roll == -600
+
+
+# ===========================================================================
+# display.py — pure image processing
+# ===========================================================================
+
+
+class TestAdaptIcon:
+    """_adapt_icon lifts dark pixels toward white and desaturates colour."""
+
+    def _solid_rgba(self, r, g, b, a=255, size=4):
+        from PIL import Image
+        img = Image.new("RGBA", (size, size), (r, g, b, a))
+        return img
+
+    def test_returns_rgba_image(self):
+        from spacenav_ws.display import _adapt_icon
+        from PIL import Image
+        result = _adapt_icon(self._solid_rgba(0, 0, 0))
+        assert isinstance(result, Image.Image)
+        assert result.mode == "RGBA"
+
+    def test_black_pixels_become_bright(self):
+        """Fully black pixels should be boosted to near-white."""
+        from spacenav_ws.display import _adapt_icon
+        result = _adapt_icon(self._solid_rgba(0, 0, 0))
+        arr = np.array(result)
+        assert arr[0, 0, 0] > 200, "red channel should be boosted toward 255"
+        assert arr[0, 0, 1] > 200, "green channel should be boosted toward 255"
+
+    def test_white_pixels_unchanged(self):
+        """Fully white pixels are above the boost threshold and should stay white."""
+        from spacenav_ws.display import _adapt_icon
+        result = _adapt_icon(self._solid_rgba(255, 255, 255))
+        arr = np.array(result)
+        assert arr[0, 0, 0] > 250
+        assert arr[0, 0, 1] > 250
+
+    def test_alpha_channel_preserved(self):
+        """Alpha is not touched by the adapt function."""
+        from spacenav_ws.display import _adapt_icon
+        result = _adapt_icon(self._solid_rgba(128, 128, 128, 64))
+        arr = np.array(result)
+        assert arr[0, 0, 3] == 64
+
+    def test_output_same_size_as_input(self):
+        from spacenav_ws.display import _adapt_icon
+        result = _adapt_icon(self._solid_rgba(100, 50, 200, size=8))
+        assert result.size == (8, 8)
+
+
+class TestImgToBgr565:
+    """_img_to_bgr565 converts RGB PIL image to little-endian BGR565 bytes."""
+
+    def test_output_length(self):
+        from PIL import Image
+        from spacenav_ws.display import _img_to_bgr565, DISPLAY_W, DISPLAY_H
+        img = Image.new("RGB", (DISPLAY_W, DISPLAY_H), (0, 0, 0))
+        data = _img_to_bgr565(img)
+        assert len(data) == DISPLAY_W * DISPLAY_H * 2  # 2 bytes per pixel
+
+    def test_pure_red_encodes_correctly(self):
+        """Pure red (255,0,0) in RGB565 = 0b00000_000000_11111 = 0x001F (little-endian)."""
+        from PIL import Image
+        from spacenav_ws.display import _img_to_bgr565
+        img = Image.new("RGB", (1, 1), (255, 0, 0))
+        data = _img_to_bgr565(img)
+        word = int.from_bytes(data[:2], "little")
+        # In BGR565: bits [15:11]=blue(0), [10:5]=green(0), [4:0]=red(31)
+        assert word & 0x001F == 31, "red channel should occupy low 5 bits"
+        assert (word >> 5) & 0x3F == 0, "green should be 0"
+        assert (word >> 11) & 0x1F == 0, "blue should be 0"
+
+    def test_pure_blue_encodes_correctly(self):
+        """Pure blue (0,0,255) → high 5 bits set in BGR565."""
+        from PIL import Image
+        from spacenav_ws.display import _img_to_bgr565
+        img = Image.new("RGB", (1, 1), (0, 0, 255))
+        data = _img_to_bgr565(img)
+        word = int.from_bytes(data[:2], "little")
+        assert (word >> 11) & 0x1F == 31, "blue channel should occupy high 5 bits"
+        assert word & 0x001F == 0, "red should be 0"
 
 
 # ===========================================================================
@@ -202,7 +320,6 @@ class TestViewMatrices:
         for name, flat in VIEW_MATRICES.items():
             M = np.array(flat).reshape(4, 4)
             R = M[:3, :3]
-            # Rotation part must be orthogonal
             np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-10, err_msg=f"{name}: R not orthogonal")
             assert math.isclose(np.linalg.det(R), 1.0, abs_tol=1e-10), f"{name}: det(R) != 1"
 
@@ -212,9 +329,7 @@ class TestViewMatrices:
     def test_top_view_looks_down(self):
         """Top view: camera -Z axis should point downward (+Z world means up, so cam -Z = world -Z = looking down)."""
         M = np.array(get_view_matrix("top")).reshape(4, 4)
-        # Row 2 of M[:3,:3] is the camera Z axis in world space; -Row2 is look direction
         look = -M[2, :3]
-        # Looking "down" in Onshape Z-up means negative Z world direction
         assert look[2] < -0.9, f"top view should look toward -Z, got look={look}"
 
     def test_front_view_looks_along_y(self):

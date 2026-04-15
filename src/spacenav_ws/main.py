@@ -19,6 +19,10 @@ from spacenav_ws.wamp import WampSession
 # Used by the /cursor endpoint and /events SSE to access per-connection cursor state.
 _active_controller: Controller | None = None
 
+# Number of currently open /cursor WebSocket connections.  Tracked globally so
+# a controller created after the cursor WS connects still sees active=True.
+_cursor_ws_count: int = 0
+
 # TODO: This handler isn't used for the uvicorn logs and I can't be bothered finding the magic logging incantations to make it so.
 logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 
@@ -82,10 +86,10 @@ async def get_mouse_event_generator():
             debug = (
                 f" | ndc=({c._cursor_ndc[0]:.3f},{c._cursor_ndc[1]:.3f})"
                 f" active={c._cursor_active}"
+                f" src={c._cursor_debug_pivot_source}"
                 f" pivot=[{c._cursor_debug_pivot[0]:.3f},{c._cursor_debug_pivot[1]:.3f},{c._cursor_debug_pivot[2]:.3f}]"
                 f" dist={c._cursor_debug_dist:.3f}"
                 f" vh={c._cursor_debug_viewport_half:.3f}"
-                f" cursor={c._cursor_debug_used_cursor}"
             )
         else:
             debug = " | no active controller"
@@ -101,19 +105,24 @@ async def event_stream():
 @app.websocket("/cursor")
 async def cursor_endpoint(ws: WebSocket):
     """Receives mouse cursor NDC coords from the userscript for pivot computation."""
+    global _cursor_ws_count
     await ws.accept()
+    _cursor_ws_count += 1
     if _active_controller is not None:
         _active_controller._cursor_active = True
     try:
         while True:
             data = await ws.receive_json()
-            if _active_controller is not None:
-                _active_controller._cursor_ndc[0] = float(data.get("x", 0.0))
-                _active_controller._cursor_ndc[1] = float(data.get("y", 0.0))
+            ctrl = _active_controller
+            if ctrl is not None:
+                ctrl._cursor_ndc[0] = float(data.get("x", 0.0))
+                ctrl._cursor_ndc[1] = float(data.get("y", 0.0))
+                ctrl._cursor_active = True
     except Exception:
         pass
     finally:
-        if _active_controller is not None:
+        _cursor_ws_count = max(0, _cursor_ws_count - 1)
+        if _active_controller is not None and _cursor_ws_count == 0:
             _active_controller._cursor_active = False
 
 
@@ -125,6 +134,8 @@ async def nlproxy(ws: WebSocket):
     spacenav_reader, _ = await get_async_spacenav_socket_reader()
     ctrl = await create_mouse_controller(wamp_session, spacenav_reader)
     _active_controller = ctrl
+    if _cursor_ws_count > 0:
+        ctrl._cursor_active = True
     try:
         # TODO, better error handling then just dropping the websocket disconnect on the floor?
         async with asyncio.TaskGroup() as tg:
@@ -140,7 +151,7 @@ def serve(host: str = "127.51.68.120", port: int = 8181, hot_reload: bool = Fals
     """Start the server that sends spacenav to browser based applications like onshape"""
     logging.warning(f"Navigate to: https://{host}:{port} You should be prompted to add the cert as an exception to your browser!!")
     uvicorn.run(
-        "spacenav_ws.main:app", host=host, port=port, ws="auto", ssl_certfile=CERT_FILE, ssl_keyfile=KEY_FILE, log_level="info", reload=hot_reload
+        "spacenav_ws.main:app", host=host, port=port, ws="auto", ssl_certfile=CERT_FILE, ssl_keyfile=KEY_FILE, log_level="info", reload=hot_reload, timeout_graceful_shutdown=2
     )
 
 

@@ -40,16 +40,51 @@ view_iso1, view_iso2     -- named view + fit to model
 fit                       -- fit current orientation to model extents
 zoom_in, zoom_out         -- scale extents ×0.8 / ×1.25
 toggle_lock_rotation      -- lock/unlock rotation (suppress pitch/yaw/roll)
+toggle_horizon_lock       -- lock/unlock horizon (suppress roll only; pitch/yaw still work)
+toggle_camera_mode        -- toggle object mode ↔ camera (fly) mode
 toggle_perspective        -- switch perspective ↔ orthographic
 roll_view                 -- snap roll to 0 while keeping look direction
 rotate_view_cw            -- roll the view 90° clockwise (image rotates CW on screen)
 rotate_view_ccw           -- roll the view 90° counterclockwise
 recall_view_1/2/3         -- recall a saved custom view
 save_view_1/2/3           -- save current view (also Shift+V1/V2/V3)
-key_esc, key_enter, key_delete, key_tab, key_space,
-key_alt, key_shift, key_ctrl  -- inject key via xdotool
+key_<key>                 -- inject a single key or chord, e.g. key_esc, key_shift+s,
+                             key_ctrl+z.  Modifier+key combos use + as separator.
+                             Named keys: esc, enter, delete, tab, space, alt, shift, ctrl
+onshape_<id>              -- invoke an Onshape command by its tree ID, e.g.
+                             onshape_extrude, onshape_mate_FASTENED.
+                             Falls back to the keyboard shortcut defined in keyboard.py.
+toggle_cursor_pivot       -- enable/disable cursor-based rotation pivot (Ctrl+Menu)
 hotkey_1 … hotkey_12      -- dispatch to configured hotkey action
 noop                      -- do nothing
+
+Built-in LCD icons  (set automatically — no config needed)
+-----------------------------------------------------------
+These actions display a custom icon on the LCD grid instead of a text label.
+Defined in icons.py as inline SVGs rendered with no brightness adaptation
+(they are already designed for the dark display).
+
+    view_iso1    isometric cube, blue top/front face highlighted
+    view_iso2    isometric cube, blue right/front face highlighted
+    view_top     cube with top face lit
+    view_bottom  cube with bottom face lit (top face dimmed)
+    view_right   cube with right face lit
+    view_left    cube with left face lit
+    view_front   cube with front face lit
+    view_back    cube with back face dimmed (opposite of front)
+    fit          crosshair / fit-to-extents symbol
+
+Onshape context icons  (loaded at runtime from Onshape's command tree)
+-----------------------------------------------------------------------
+When using onshape_<id> actions in context_hotkeys, the icon Onshape sends
+for that command ID is shown automatically — no extra config needed.  The
+icon appears after the first time Onshape sends the images update for that
+context (usually within a second of entering the context).
+
+Icons are only available for IDs that appear in the Onshape command tree.
+To discover available IDs and whether icons are cached, check the logs:
+
+    journalctl --user -u spacenav-ws | grep "svg_cache ids"
 """
 
 import json
@@ -57,7 +92,6 @@ import logging
 from pathlib import Path
 
 from spacenav_ws.icons import VIEW_ICONS
-
 
 # ---------------------------------------------------------------------------
 # Primary button map  (button_id → action, no modifier held)
@@ -93,7 +127,7 @@ ENTERPRISE_DEFAULT_BUTTON_MAP: dict[int, str] = {
     18: "key_esc",
     19: "key_alt",
     # 20 is the Shift modifier — handled separately, NOT in this map
-    21: "key_ctrl",
+    # 21 is the Ctrl modifier — handled separately, NOT in this map
     23: "key_enter",
     24: "key_delete",
     25: "key_tab",
@@ -104,10 +138,12 @@ ENTERPRISE_DEFAULT_BUTTON_MAP: dict[int, str] = {
 # Shift-modified actions  (button_id → action when Shift is held)
 # ---------------------------------------------------------------------------
 ENTERPRISE_DEFAULT_SHIFT_MAP: dict[int, str] = {
+    12: "toggle_camera_mode",  # Shift + Menu → toggle object/camera mode
     14: "view_bottom",  # Shift + Top
     15: "view_left",  # Shift + Right
     16: "view_back",  # Shift + Front
     17: "rotate_view_ccw",  # Shift + Rotate → rotate left
+    22: "toggle_horizon_lock",  # Shift + Lock → horizon lock (suppress roll only)
     27: "save_view_1",  # Shift + V1
     28: "save_view_2",  # Shift + V2
     29: "save_view_3",  # Shift + V3
@@ -116,6 +152,16 @@ ENTERPRISE_DEFAULT_SHIFT_MAP: dict[int, str] = {
 
 # The Shift key button ID — tracked as a held modifier, never dispatched as an action
 SHIFT_BUTTON_ID = 20
+
+# The Ctrl key button ID — tracked as a held modifier, never dispatched as an action
+CTRL_BUTTON_ID = 21
+
+# ---------------------------------------------------------------------------
+# Ctrl-modified actions  (button_id → action when Ctrl is held)
+# ---------------------------------------------------------------------------
+ENTERPRISE_DEFAULT_CTRL_MAP: dict[int, str] = {
+    12: "toggle_cursor_pivot",  # Ctrl + Menu → toggle cursor-based rotation pivot
+}
 
 # ---------------------------------------------------------------------------
 # Default hotkey labels & actions for the 12 programmable keys
@@ -130,8 +176,8 @@ _DEFAULT_HOTKEY_DEFS: list[dict] = [
     {"label": "BACK", "action": "view_back"},
     {"label": "BOTT", "action": "view_bottom"},
     {"label": "LEFT", "action": "view_left"},
-    {"label": "", "action": "noop"},
-    {"label": "", "action": "noop"},
+    {"label": "CHFR", "action": "onshape_chamfer"},
+    {"label": "DRFT", "action": "onshape_draft"},
     {"label": "", "action": "noop"},
 ]
 
@@ -195,6 +241,17 @@ def get_shift_map() -> dict[int, str]:
     return m
 
 
+def get_ctrl_map() -> dict[int, str]:
+    config = load_config()
+    m = dict(ENTERPRISE_DEFAULT_CTRL_MAP)
+    for k, v in config.get("ctrl_map", {}).items():
+        try:
+            m[int(k)] = str(v)
+        except ValueError:
+            logging.warning("Invalid ctrl_map key: %r", k)
+    return m
+
+
 def get_hotkeys() -> list[dict]:
     config = load_config()
     hotkeys = [dict(h) for h in DEFAULT_HOTKEYS]
@@ -204,3 +261,32 @@ def get_hotkeys() -> list[dict]:
             "action": str(entry.get("action", "noop")),
         }
     return hotkeys
+
+
+def get_context_hotkey_map() -> dict[str, list[dict]]:
+    """Return per-context hotkey overrides from config.
+
+    Config format (context name matches Onshape's activeSet string):
+    {
+        "context_hotkeys": {
+            "Assembly": [
+                {"label": "INS",  "action": "onshape_insertPart"},
+                {"label": "FAST", "action": "onshape_mate_FASTENED"}
+            ]
+        }
+    }
+
+    When a context override is defined it takes priority over the Onshape
+    command tree for both display and button dispatch.
+    """
+    config = load_config()
+    result: dict[str, list[dict]] = {}
+    for context, entries in config.get("context_hotkeys", {}).items():
+        hotkeys = []
+        for entry in list(entries)[:12]:
+            hotkeys.append({
+                "label": str(entry.get("label", ""))[:4].upper(),
+                "action": str(entry.get("action", "noop")),
+            })
+        result[str(context)] = hotkeys
+    return result

@@ -41,8 +41,8 @@ SHORTCUTS: dict[str, str] = {
     "fillet": "shift+f",
     # No default Onshape shortcuts for the following — assign them in
     # Onshape Preferences → Keyboard Shortcuts, then mirror here:
-    "chamfer": "shift+c",  # user-assigned example
-    "draft": "shift+d",  # user-assigned example
+    "chamfer": "shift+alt+c",
+    "draft": "shift+alt+d",
     "shell": "shift+h",  # user-assigned example
     "mirror": "shift+m",  # user-assigned example
     "pattern": "shift+p",  # user-assigned example
@@ -94,8 +94,22 @@ SHORTCUTS: dict[str, str] = {
     "SPLINE": "alt+v",  # Spline
     "ELLIPSE": "shift+b",  # Ellipse
     # ── Assembly ─────────────────────────────────────────────────────────
-    "insertPart": "i",
-    "fastenMate": "m",
+    # Tree IDs confirmed from live svg_cache logs (active='Assembly')
+    "mate_FASTENED": "m",                       # Onshape default
+    "insertPartOrAssembly": "i",                # Onshape default (tree ID: Assembly-insertPartOrAssembly)
+    "TOGGLE_ASSEMBLY_SNAP_MODE": "shift+s",     # user-assigned
+    "TOGGLE_SHOW_MATES_ON_SELECTION_MODE": "j", # Onshape default
+    # User-assigned shortcuts:
+    "geometryMate_TANGENT": "t",
+    "widthMate_WIDTH": "shift+w",               # tree ID: widthMate_WIDTH
+    # Remaining mate types — assign in Onshape Preferences then uncomment:
+    # "mate_REVOLUTE": "shift+alt+r",
+    # "mate_CYLINDRICAL": "shift+alt+y",
+    # "mate_SLIDER": "shift+alt+s",
+    # "mate_PLANAR": "shift+alt+p",
+    # "mate_BALL": "shift+alt+b",
+    # "mate_PARALLEL": "shift+alt+l",
+    # "mate_PIN_SLOT": "shift+alt+n",
     # ── General ──────────────────────────────────────────────────────────
     "fit": "f",
     "zoomIn": "shift+z",

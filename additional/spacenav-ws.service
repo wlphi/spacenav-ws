@@ -9,6 +9,7 @@ Wants=spacenavd.service
 Type=simple
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=5
 
 # --- PyPI / uvx install (default) ---
 # Runs the latest published release directly without cloning:

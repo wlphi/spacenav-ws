@@ -16,7 +16,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.3.5"]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-cov>=7.1.0",
+]
 
 [project.scripts]
 spacenav-ws = "spacenav_ws.main:cli"

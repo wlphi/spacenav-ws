@@ -29,6 +29,8 @@ Then: sudo udevadm control --reload-rules && sudo udevadm trigger
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -65,8 +67,13 @@ _FONT_SIZE_MSG = 40  # for full-screen status messages
 
 _COLS = 6
 _ROWS = 2
-_CELL_W = DISPLAY_W // _COLS  # ~106
-_CELL_H = DISPLAY_H // _ROWS  # 75
+_CELL_W = DISPLAY_W // _COLS   # 106 px
+# Reserve _SENS_BAR_H + 1 px gap at the bottom for the sensitivity bar so the
+# grid cells never overlap it.  Defined here so _draw_sensitivity_bar can use
+# DISPLAY_H independently while render_hotkey_grid uses _GRID_H.
+_SENS_BAR_H = 5
+_GRID_H  = DISPLAY_H - _SENS_BAR_H - 1  # 144 px  (1 px gap above bar)
+_CELL_H  = _GRID_H // _ROWS              # 72 px
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +213,17 @@ def _adapt_icon(icon):
     return Image.fromarray(out, "RGBA")
 
 
-# Sensitivity bar constants
-_SENS_BAR_H = 5  # px — thin strip at the very bottom of the display
+# Sensitivity bar constants  (_SENS_BAR_H defined with grid constants above)
 _SENS_LEVELS = 5
 _C_SENS_ON = (80, 160, 255)  # filled segment — cool blue
 _C_SENS_OFF = (30, 35, 50)  # empty segment — near-background
+
+# Camera mode badge
+_C_CAMERA_BADGE = (255, 150, 40)  # orange — visually distinct from blue sensitivity bar
+
+# Cursor-pivot badge (top-left)
+_C_CURSOR_PIVOT_ON  = (60, 220, 120)   # green  — pivot active
+_C_CURSOR_PIVOT_OFF = (80,  50,  50)   # dark red — pivot disabled
 
 
 def _draw_sensitivity_bar(draw, level: int) -> None:
@@ -228,11 +241,18 @@ def _draw_sensitivity_bar(draw, level: int) -> None:
         draw.rectangle([x0, y0, x1, y1], fill=color)
 
 
-def render_hotkey_grid(hotkeys: list[dict], sensitivity_level: int = 0) -> bytes:
+def render_hotkey_grid(
+    hotkeys: list[dict],
+    sensitivity_level: int = 0,
+    camera_mode: bool = False,
+    cursor_pivot_enabled: bool = True,
+) -> bytes:
     """Render a 6×2 grid of icon+label cells and return a BGR565 packet.
 
-    sensitivity_level: 1–5 draws a thin indicator bar at the bottom;
+    sensitivity_level: 1–5 draws a thin blue indicator bar at the bottom;
                        0 (default) omits it.
+    camera_mode: True draws an orange "CAM" badge in the top-right corner.
+    cursor_pivot_enabled: False draws a dim red "CPV" badge in the top-left corner.
     """
     from PIL import Image, ImageDraw
 
@@ -253,7 +273,7 @@ def render_hotkey_grid(hotkeys: list[dict], sensitivity_level: int = 0) -> bytes
     # ── Grid dividers ───────────────────────────────────────────────────
     for col in range(1, _COLS):
         x = col * _CELL_W
-        draw.line([(x, 0), (x, DISPLAY_H - 1)], fill=_C_GRID, width=1)
+        draw.line([(x, 0), (x, _GRID_H - 1)], fill=_C_GRID, width=1)
     for row in range(1, _ROWS):
         y = row * _CELL_H
         draw.line([(0, y), (DISPLAY_W - 1, y)], fill=_C_GRID, width=1)
@@ -294,6 +314,27 @@ def render_hotkey_grid(hotkeys: list[dict], sensitivity_level: int = 0) -> bytes
 
     if 1 <= sensitivity_level <= _SENS_LEVELS:
         _draw_sensitivity_bar(draw, sensitivity_level)
+
+    if camera_mode:
+        badge_font = _get_font(11)
+        badge_text = "CAM"
+        bb = badge_font.getbbox(badge_text)
+        bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+        pad = 3
+        bx = DISPLAY_W - bw - bb[0] - pad * 2 - 1
+        by = 1
+        draw.rectangle([bx - pad, by, DISPLAY_W - 2, by + bh + pad * 2], fill=(60, 30, 0))
+        draw.text((bx, by + pad - bb[1]), badge_text, fill=_C_CAMERA_BADGE, font=badge_font)
+
+    if not cursor_pivot_enabled:
+        badge_font = _get_font(11)
+        badge_text = "CPV"
+        bb = badge_font.getbbox(badge_text)
+        bh = bb[3] - bb[1]
+        pad = 3
+        by = 1
+        draw.rectangle([1, by, bb[2] - bb[0] + pad * 2 + 1, by + bh + pad * 2], fill=(40, 15, 15))
+        draw.text((1 + pad - bb[0], by + pad - bb[1]), badge_text, fill=_C_CURSOR_PIVOT_OFF, font=badge_font)
 
     return _build_packet(_img_to_bgr565(img))
 
@@ -436,8 +477,8 @@ def set_lock_led(on: bool) -> None:
     No-op when the device is absent or the caller lacks read-write permission
     on the event node (requires 'input' group membership).
     """
+    import os as _os
     import struct
-    import time as _time
 
     EV_LED = 0x11
     LED_SUSPEND = 0x06  # SpaceMouse Enterprise rotation-lock LED
@@ -449,9 +490,7 @@ def set_lock_led(on: bool) -> None:
     try:
         # input_event: { struct timeval tv; __u16 type; __u16 code; __s32 value; }
         # On 64-bit Linux timeval = two int64 fields (sec, usec).
-        import os as _os
-
-        t = int(_time.time())
+        t = int(time.time())
         ev = struct.pack("qqHHi", t, 0, EV_LED, LED_SUSPEND, 1 if on else 0)
         fd = _os.open(path, _os.O_WRONLY | _os.O_NONBLOCK)
         try:
@@ -483,6 +522,7 @@ class EnterpriseDisplay:
     def __init__(self) -> None:
         self._handle = None
         self._hidraw: str | None = None
+        self._lock = threading.Lock()
         self._open()
 
     def _open(self) -> None:
@@ -517,8 +557,6 @@ class EnterpriseDisplay:
 
         # Retry a few times: a previous server killed with SIGKILL may leave
         # the interface marked busy until the OS releases the file descriptors.
-        import time
-
         last_exc: Exception | None = None
         for attempt in range(1, 5):
             try:
@@ -536,6 +574,13 @@ class EnterpriseDisplay:
                     _USB_EP,
                     self._hidraw,
                 )
+                # Wait for the device's boot splash animation to complete
+                # before sending the first host frame.  Run in a daemon thread
+                # so the 3 s wait does not block uvicorn startup.
+                import threading
+                threading.Thread(
+                    target=self._splash_clear, daemon=True
+                ).start()
                 break
             except Exception as exc:
                 last_exc = exc
@@ -544,6 +589,16 @@ class EnterpriseDisplay:
                     time.sleep(0.4)
         else:
             logging.warning("Display: could not claim USB interface — %s", last_exc)
+
+    def _splash_clear(self) -> None:
+        """Clear any residual garbage from the previous session immediately, then
+        overwrite the boot splash animation that plays on fresh power-on.
+
+        Called in a daemon thread from _open() so it does not delay startup.
+        """
+        self.clear()       # immediate: wipes leftover frame from previous session
+        time.sleep(3.0)    # wait for device boot animation (fresh power-on)
+        self.clear()       # wipe boot splash
 
     def close(self) -> None:
         if self._handle is not None:
@@ -572,36 +627,45 @@ class EnterpriseDisplay:
              controller into "accept new frame" mode (wValue=0x0314 equivalent).
           2. Packet data sent to EP 0x01 in 64-byte bulk chunks.
         """
-        if self._handle is None:
-            return False
-        # Step 1: tell the LCD controller a new frame is coming.
-        if self._hidraw:
-            _lcd_send_feature(self._hidraw, _LCD_FRAME_PREPARE)
-        # Step 2: send compressed frame data in 64-byte bulk chunks.
-        try:
-            data = bytearray(packet)
-            offset = 0
-            while offset < len(data):
-                chunk = data[offset : offset + _USB_CHUNK]
-                self._handle.write(_USB_EP, chunk, _USB_TIMEOUT)
-                offset += _USB_CHUNK
-            return True
-        except Exception as exc:
-            logging.debug("Display: write failed — %s", exc)
-            self._handle = None
-            return False
+        with self._lock:
+            if self._handle is None:
+                return False
+            # Step 1: tell the LCD controller a new frame is coming.
+            if self._hidraw:
+                _lcd_send_feature(self._hidraw, _LCD_FRAME_PREPARE)
+            # Step 2: send compressed frame data in 64-byte bulk chunks.
+            try:
+                data = bytearray(packet)
+                offset = 0
+                while offset < len(data):
+                    chunk = data[offset : offset + _USB_CHUNK]
+                    self._handle.write(_USB_EP, chunk, _USB_TIMEOUT)
+                    offset += _USB_CHUNK
+                return True
+            except Exception as exc:
+                logging.warning("Display: USB write failed (offset=%d/%d) — %s", offset, len(data), exc)
+                self._handle = None
+                return False
 
     # ------------------------------------------------------------------
     # High-level update methods
     # ------------------------------------------------------------------
 
-    def show_hotkeys(self, hotkeys: list[dict], sensitivity_level: int = 0) -> None:
+    def show_hotkeys(
+        self,
+        hotkeys: list[dict],
+        sensitivity_level: int = 0,
+        camera_mode: bool = False,
+        cursor_pivot_enabled: bool = True,
+    ) -> None:
         """Display the 12 hotkey labels in a 6×2 grid.
 
-        sensitivity_level 1–5 draws the indicator bar; 0 omits it.
+        sensitivity_level 1–5 draws the blue indicator bar; 0 omits it.
+        camera_mode True draws the orange CAM badge.
+        cursor_pivot_enabled False draws the dim red CPV badge.
         """
         try:
-            self._send(render_hotkey_grid(hotkeys, sensitivity_level))
+            self._send(render_hotkey_grid(hotkeys, sensitivity_level, camera_mode, cursor_pivot_enabled))
         except Exception as exc:
             logging.debug("Display: show_hotkeys failed — %s", exc)
 
