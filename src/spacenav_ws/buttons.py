@@ -125,7 +125,7 @@ ENTERPRISE_DEFAULT_BUTTON_MAP: dict[int, str] = {
     29: "recall_view_3",
     # Keyboard injection
     18: "key_esc",
-    19: "key_alt",
+    # 19 is the Alt modifier — handled separately, NOT in this map
     # 20 is the Shift modifier — handled separately, NOT in this map
     # 21 is the Ctrl modifier — handled separately, NOT in this map
     23: "key_enter",
@@ -156,11 +156,28 @@ SHIFT_BUTTON_ID = 20
 # The Ctrl key button ID — tracked as a held modifier, never dispatched as an action
 CTRL_BUTTON_ID = 21
 
+# The Alt key button ID — tracked as a held modifier, never dispatched as an action
+ALT_BUTTON_ID = 19
+
 # ---------------------------------------------------------------------------
 # Ctrl-modified actions  (button_id → action when Ctrl is held)
 # ---------------------------------------------------------------------------
 ENTERPRISE_DEFAULT_CTRL_MAP: dict[int, str] = {
     12: "toggle_cursor_pivot",  # Ctrl + Menu → toggle cursor-based rotation pivot
+}
+
+# ---------------------------------------------------------------------------
+# Alt-modified actions  (button_id → action when Alt is held)
+# ---------------------------------------------------------------------------
+ENTERPRISE_DEFAULT_ALT_MAP: dict[int, str] = {
+    12: "toggle_invert_pitch",  # Alt + Menu → invert pitch axis
+}
+
+# ---------------------------------------------------------------------------
+# Ctrl+Alt-modified actions  (button_id → action when both Ctrl and Alt held)
+# ---------------------------------------------------------------------------
+ENTERPRISE_DEFAULT_CTRL_ALT_MAP: dict[int, str] = {
+    12: "toggle_swap_yz",  # Ctrl + Alt + Menu → swap zoom ↔ vertical pan axes
 }
 
 # ---------------------------------------------------------------------------
@@ -219,6 +236,70 @@ def load_config() -> dict:
     return _config_cache
 
 
+def _read_config_from_disk() -> dict:
+    """Read config.json directly from disk, bypassing the cache."""
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            logging.warning("_read_config_from_disk: could not read %s", CONFIG_PATH)
+    return {}
+
+
+def _write_config_to_disk(cfg: dict) -> None:
+    """Write cfg to config.json and update the in-memory cache."""
+    global _config_cache
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        _config_cache = cfg
+    except Exception:
+        logging.warning("_write_config_to_disk: could not write %s", CONFIG_PATH)
+
+
+def save_device_state(
+    *,
+    sensitivity_level: int,
+    invert_pitch: bool,
+    swap_yz: bool,
+    lock_rotation: bool,
+    horizon_lock: bool,
+    camera_mode: bool,
+    cursor_pivot: bool,
+) -> None:
+    """Persist all device toggle state to config.json under the 'state' key."""
+    cfg = _read_config_from_disk()
+    cfg["state"] = {
+        "sensitivity_level": sensitivity_level,
+        "invert_pitch":      invert_pitch,
+        "swap_yz":           swap_yz,
+        "lock_rotation":     lock_rotation,
+        "horizon_lock":      horizon_lock,
+        "camera_mode":       camera_mode,
+        "cursor_pivot":      cursor_pivot,
+    }
+    _write_config_to_disk(cfg)
+
+
+def load_device_state() -> dict:
+    """Return persisted device state, falling back to safe defaults.
+
+    Reads from the unified 'state' key; also accepts legacy 'axis_flags' and
+    'sensitivity_level' top-level keys written by earlier versions.
+    """
+    cfg = load_config()
+    state = cfg.get("state", {})
+    # Legacy fallbacks so old config.json files keep working.
+    if "sensitivity_level" not in state:
+        state["sensitivity_level"] = cfg.get("sensitivity_level", 3)
+    if "invert_pitch" not in state:
+        state["invert_pitch"] = cfg.get("axis_flags", {}).get("invert_pitch", False)
+    if "swap_yz" not in state:
+        state["swap_yz"] = cfg.get("axis_flags", {}).get("swap_yz", False)
+    return state
+
+
 def get_button_map() -> dict[int, str]:
     config = load_config()
     m = dict(ENTERPRISE_DEFAULT_BUTTON_MAP)
@@ -249,6 +330,28 @@ def get_ctrl_map() -> dict[int, str]:
             m[int(k)] = str(v)
         except ValueError:
             logging.warning("Invalid ctrl_map key: %r", k)
+    return m
+
+
+def get_alt_map() -> dict[int, str]:
+    config = load_config()
+    m = dict(ENTERPRISE_DEFAULT_ALT_MAP)
+    for k, v in config.get("alt_map", {}).items():
+        try:
+            m[int(k)] = str(v)
+        except ValueError:
+            logging.warning("Invalid alt_map key: %r", k)
+    return m
+
+
+def get_ctrl_alt_map() -> dict[int, str]:
+    config = load_config()
+    m = dict(ENTERPRISE_DEFAULT_CTRL_ALT_MAP)
+    for k, v in config.get("ctrl_alt_map", {}).items():
+        try:
+            m[int(k)] = str(v)
+        except ValueError:
+            logging.warning("Invalid ctrl_alt_map key: %r", k)
     return m
 
 

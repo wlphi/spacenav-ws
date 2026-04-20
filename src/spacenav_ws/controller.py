@@ -17,14 +17,19 @@ for _k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS
 import numpy as np  # noqa: E402
 
 from spacenav_ws.buttons import (  # noqa: E402
+    ALT_BUTTON_ID,
     CTRL_BUTTON_ID,
     SHIFT_BUTTON_ID,
+    get_alt_map,
     get_button_map,
     get_context_hotkey_map,
+    get_ctrl_alt_map,
     get_ctrl_map,
     get_hotkeys,
     get_shift_map,
     load_config,
+    load_device_state,
+    save_device_state,
 )
 from spacenav_ws.display import EnterpriseDisplay, set_lock_led  # noqa: E402
 from spacenav_ws.spacenav import ButtonEvent, MotionEvent, from_message  # noqa: E402
@@ -204,19 +209,25 @@ class Controller:
 
         self.subscribed = False
         self.focus = False
-        self.lock_rotation = False
-        self._horizon_lock: bool = False  # suppress roll only; pitch/yaw still active
+        _st = load_device_state()
+        self.lock_rotation: bool = bool(_st.get("lock_rotation", False))
+        self._horizon_lock: bool = bool(_st.get("horizon_lock", False))
         self.shift_held = False
         self.ctrl_held = False
-        self._cursor_pivot_enabled: bool = True
+        self.alt_held = False
+        self._invert_pitch: bool = bool(_st.get("invert_pitch", False))
+        self._swap_yz: bool = bool(_st.get("swap_yz", False))
+        self._cursor_pivot_enabled: bool = bool(_st.get("cursor_pivot", True))
         self._auto_lock_active: bool = False  # True when lock was applied automatically by context
         self._notification_task: asyncio.Task | None = None  # strong ref so GC won't cancel it
         self._icon_refresh_task: asyncio.Task | None = None  # strong ref for icon refresh tasks
-        set_lock_led(False)  # reset LED to match initial lock_rotation state
+        set_lock_led(self.lock_rotation)  # restore LED to match persisted lock state
 
         self.button_map: dict[int, str] = get_button_map()
         self.shift_map: dict[int, str] = get_shift_map()
         self.ctrl_map: dict[int, str] = get_ctrl_map()
+        self.alt_map: dict[int, str] = get_alt_map()
+        self.ctrl_alt_map: dict[int, str] = get_ctrl_alt_map()
         self.hotkeys: list[dict] = get_hotkeys()
         self.context_hotkey_map: dict[str, list[dict]] = get_context_hotkey_map()
         self.saved_views: dict[int, dict] = _load_saved_views()
@@ -240,8 +251,7 @@ class Controller:
         # can suppress a spurious Shift-release that arrives right after an inject.
         self._last_key_inject_time: float = 0.0
 
-        # Cached viewport aspect ratio (width/height), updated by _fit_affine.
-        # Used as fallback when view.extents is not yet available.
+        # Fallback viewport aspect ratio used when view.extents is not yet available.
         self._viewport_ar: float = 16.0 / 9.0
 
         # Cursor NDC position received from the /cursor WebSocket.
@@ -265,13 +275,13 @@ class Controller:
         # Runtime sensitivity level (1–5); multiplied on top of base scales.
         # Level 3 = 1.0× (config value unchanged).
         self._SENSITIVITY_MULTIPLIERS = (0.2, 0.5, 1.0, 2.0, 4.0)
-        self._sensitivity_level: int = 3  # 1-indexed
+        self._sensitivity_level: int = max(1, min(5, int(_st.get("sensitivity_level", 3))))
         self._apply_sensitivity()
 
         # Camera mode: when True, all rotation and lateral translation axes are
         # inverted so the puck feels like flying (camera moves) rather than
         # manipulating an object (model moves).
-        self._camera_mode: bool = False
+        self._camera_mode: bool = bool(_st.get("camera_mode", False))
 
         # Context-aware commands sent by Onshape via client_update
         self._active_set: str = ""
@@ -510,11 +520,22 @@ class Controller:
             self.ctrl_held = event.pressed
             return
 
+        # Track Alt modifier — same pattern as Shift/Ctrl.
+        if event.button_id == ALT_BUTTON_ID:
+            self.alt_held = event.pressed
+            return
+
         if not event.pressed:
             return  # ignore releases for all other buttons
 
-        # Ctrl-modified action takes priority, then Shift, then base map.
-        if self.ctrl_held and event.button_id in self.ctrl_map:
+        # Priority: Ctrl+Alt > Ctrl > Shift > base map.
+        if self.ctrl_held and self.alt_held and event.button_id in self.ctrl_alt_map:
+            action = self.ctrl_alt_map[event.button_id]
+            modifier = " [+Ctrl+Alt]"
+        elif self.alt_held and event.button_id in self.alt_map:
+            action = self.alt_map[event.button_id]
+            modifier = " [+Alt]"
+        elif self.ctrl_held and event.button_id in self.ctrl_map:
             action = self.ctrl_map[event.button_id]
             modifier = " [+Ctrl]"
         elif self.shift_held and event.button_id in self.shift_map:
@@ -540,7 +561,7 @@ class Controller:
             await self._action_set_view(action[5:])
 
         elif action == "fit":
-            await self._action_fit()
+            self._inject_key("f")
 
         elif action == "zoom_in":
             await self._action_zoom(0.8)
@@ -551,6 +572,7 @@ class Controller:
             self.lock_rotation = not self.lock_rotation
             self._auto_lock_active = False  # user took manual control
             set_lock_led(self.lock_rotation)
+            self._persist_state()
             msg = "LOCK ON" if self.lock_rotation else "LOCK OFF"
             logging.info(msg)
             loop = asyncio.get_running_loop()
@@ -560,7 +582,28 @@ class Controller:
 
         elif action == "toggle_horizon_lock":
             self._horizon_lock = not self._horizon_lock
+            self._persist_state()
             msg = "HORIZ ON" if self._horizon_lock else "HORIZ OFF"
+            logging.info(msg)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.display.show_message, msg)
+            await asyncio.sleep(1.2)
+            await self._restore_context_display()
+
+        elif action == "toggle_invert_pitch":
+            self._invert_pitch = not self._invert_pitch
+            self._persist_state()
+            msg = "PTCH INV" if self._invert_pitch else "PTCH NRM"
+            logging.info(msg)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.display.show_message, msg)
+            await asyncio.sleep(1.2)
+            await self._restore_context_display()
+
+        elif action == "toggle_swap_yz":
+            self._swap_yz = not self._swap_yz
+            self._persist_state()
+            msg = "YZ SWAP" if self._swap_yz else "YZ NORM"
             logging.info(msg)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.display.show_message, msg)
@@ -640,164 +683,54 @@ class Controller:
         if matrix is None:
             logging.warning("Unknown view: %r", view_name)
             return
+
+        # Build the affine with correct orientation AND centering.
+        #
+        # view.affine stores the 4×4 camera transform (row-major):
+        #   rows 0-2 = camera axes in world space (R)
+        #   row 3    = pan offset (T), such that:
+        #              p_cam = p_world @ R + T
+        #
+        # Responsibility split:
+        #   * Orientation + centering → us (exact math, unit-testable).
+        #   * Zoom (view.extents)     → Onshape's native F key (guaranteed
+        #     correct; avoids reimplementing Onshape's undocumented padding
+        #     and AR correction, which were both subtly wrong previously).
+        #
+        # Centering: choose T so the model centre maps to camera-space origin.
+        #   model_centre_cam = centre_world @ R + T = 0
+        #   ⟹ T = -(centre_world @ R)
+        A = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
         model_extents = await self.remote_read("model.extents")
-        curr_extents = await self.remote_read("view.extents")
-        perspective = await self.remote_read("view.perspective")
+        if model_extents and len(model_extents) >= 6:
+            mn = np.array(model_extents[:3], dtype=np.float64)
+            mx = np.array(model_extents[3:6], dtype=np.float64)
+            centre = (mn + mx) / 2.0
+            R = A[:3, :3]
+            A[3, :3] = -(centre @ R)
+            affine = A.reshape(-1).tolist()
+        else:
+            # No extents yet (empty document?) — fall back to pure rotation.
+            affine = matrix
+
         try:
             await self.remote_write("view.perspective", False)
         except Exception:
             pass
-
-        if not model_extents or len(model_extents) < 6:
-            logging.warning("_action_set_view: model.extents unavailable — aborting")
-            return
-        A = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
-        R = A[:3, :3]
-        mn = np.array(model_extents[:3], dtype=np.float64)
-        mx = np.array(model_extents[3:6], dtype=np.float64)
-
-        # Centre the view on the model by shifting the camera pan offset.
-        center = (mn + mx) / 2.0
-        cam_ctr = center @ R  # model centre in camera space
-        A[3, :3] = -cam_ctr  # pan so model centre = viewport origin
-
-        # Compute orthographic half-extents that fit the model.
-        if curr_extents and len(curr_extents) >= 5 and curr_extents[3] > 1e-9 and curr_extents[4] > 1e-9:
-            viewport_ar = curr_extents[3] / curr_extents[4]
-        else:
-            viewport_ar = self._viewport_ar
-        corners = np.array(
-            [
-                [mn[0], mn[1], mn[2]],
-                [mx[0], mn[1], mn[2]],
-                [mn[0], mx[1], mn[2]],
-                [mx[0], mx[1], mn[2]],
-                [mn[0], mn[1], mx[2]],
-                [mx[0], mn[1], mx[2]],
-                [mn[0], mx[1], mx[2]],
-                [mx[0], mx[1], mx[2]],
-            ],
-            dtype=np.float64,
-        )
-        cam = corners @ R
-        lo, hi = cam.min(0), cam.max(0)
-        hx = (hi[0] - lo[0]) / 2.0 * 1.05
-        hy = (hi[1] - lo[1]) / 2.0 * 1.05
-        hz = (hi[2] - lo[2]) / 2.0 * 1.05
-        if hy < 1e-12:
-            hy = hx / viewport_ar
-        if hx / hy >= viewport_ar:
-            ext_x, ext_y = hx, hx / viewport_ar
-        else:
-            ext_x, ext_y = hy * viewport_ar, hy
-        extents = [-ext_x, -ext_y, -hz, ext_x, ext_y, hz]
-
         await self.remote_write("motion", True)
-        await self.remote_write("view.affine", A.reshape(-1).tolist())
-        if not perspective:
-            await self.remote_write("view.extents", extents)
+        await self.remote_write("view.affine", affine)
         await self.remote_write("motion", False)
+
+        # Wait for Onshape to process the WAMP writes and update its render
+        # state, then let its own fit algorithm set the correct extents.
+        # 150 ms is conservative (local WAMP round-trip is <10 ms); it
+        # ensures the new affine is in effect before F is evaluated.
+        await asyncio.sleep(0.15)
+        self._inject_key("f")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.display.show_message, view_name.upper())
         await asyncio.sleep(0.8)
         await self._restore_context_display()
-
-    async def _action_fit(self):
-        curr_affine = await self.remote_read("view.affine")
-        if not curr_affine or len(curr_affine) < 16:
-            return
-        A = np.asarray(curr_affine, dtype=np.float64).reshape(4, 4)
-        await self._fit_affine(A)
-
-    async def _fit_affine(self, A: np.ndarray):
-        """Reposition and scale affine A to fit the model, then apply it."""
-        model_extents = await self.remote_read("model.extents")
-        perspective = await self.remote_read("view.perspective")
-        curr_extents = await self.remote_read("view.extents")
-
-        if not model_extents or len(model_extents) < 6:
-            logging.warning("_fit_affine: model.extents unavailable — aborting")
-            return
-        mn = np.array(model_extents[0:3], dtype=np.float64)
-        mx = np.array(model_extents[3:6], dtype=np.float64)
-        center = (mn + mx) / 2.0
-        R = A[:3, :3]  # rows = camera axes in world space
-
-        if perspective:
-            radius = np.linalg.norm(mx - mn) * 0.5
-            cam_z_world = R[2, :]
-            dist = max(radius / np.tan(np.radians(22.5)), radius * 1.1)
-            cam_pos = center + cam_z_world * dist
-            new_affine = np.array(A)
-            new_affine[3, :3] = cam_pos
-            await asyncio.gather(
-                self.remote_write("motion", True),
-                self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
-            )
-            return
-
-        # Infer viewport aspect ratio (width/height) from the current extents.
-        # Onshape always stores extents with ext_x / ext_y == viewport AR.
-        if curr_extents and len(curr_extents) >= 5 and curr_extents[3] > 1e-9 and curr_extents[4] > 1e-9:
-            viewport_ar = curr_extents[3] / curr_extents[4]
-            self._viewport_ar = viewport_ar  # cache for next time
-        else:
-            viewport_ar = self._viewport_ar
-
-        # Project 8 model corners into camera space using A.
-        corners = np.array(
-            [
-                [mn[0], mn[1], mn[2]],
-                [mx[0], mn[1], mn[2]],
-                [mn[0], mx[1], mn[2]],
-                [mx[0], mx[1], mn[2]],
-                [mn[0], mn[1], mx[2]],
-                [mx[0], mn[1], mx[2]],
-                [mn[0], mx[1], mx[2]],
-                [mx[0], mx[1], mx[2]],
-            ],
-            dtype=np.float64,
-        )
-        cam = corners @ R + A[3, :3]
-
-        # Compute the camera-space bounding box of the model and its centre.
-        cam_lo = cam.min(axis=0)
-        cam_hi = cam.max(axis=0)
-        cam_center = (cam_lo + cam_hi) / 2.0
-
-        # Half-extents measured from the model's camera-space centre,
-        # not from the viewport origin, so off-centre models fit correctly.
-        cam_x_half = float((cam_hi[0] - cam_lo[0]) / 2.0)
-        cam_y_half = float((cam_hi[1] - cam_lo[1]) / 2.0)
-        cam_z_half = float((cam_hi[2] - cam_lo[2]) / 2.0)
-
-        # Shift the affine translation so the model centre lands at the
-        # viewport origin.  This is a delta on the existing translation,
-        # so it works regardless of where the current pan is.
-        new_affine = np.array(A, dtype=np.float64)
-        new_affine[3, :3] -= cam_center
-
-        # Scale to maintain viewport aspect ratio so the model isn't distorted.
-        pad = 1.05
-        if cam_y_half < 1e-12:
-            cam_y_half = cam_x_half / viewport_ar
-        model_ar = cam_x_half / cam_y_half
-        if model_ar >= viewport_ar:
-            ext_x = cam_x_half * pad
-            ext_y = ext_x / viewport_ar
-        else:
-            ext_y = cam_y_half * pad
-            ext_x = ext_y * viewport_ar
-        ext_z = cam_z_half * pad
-
-        extents = [-ext_x, -ext_y, -ext_z, ext_x, ext_y, ext_z]
-
-        logging.info("fit AR=%.3f ext_xy=[%.4f, %.4f]", viewport_ar, ext_x, ext_y)
-        await asyncio.gather(
-            self.remote_write("motion", True),
-            self.remote_write("view.affine", new_affine.reshape(-1).tolist()),
-            self.remote_write("view.extents", extents),
-        )
 
     async def _action_zoom(self, scale: float):
         perspective = await self.remote_read("view.perspective")
@@ -1048,6 +981,18 @@ class Controller:
     #  Sensitivity                                                         #
     # ------------------------------------------------------------------ #
 
+    def _persist_state(self) -> None:
+        """Write all toggle state to config.json so it survives restarts."""
+        save_device_state(
+            sensitivity_level=self._sensitivity_level,
+            invert_pitch=self._invert_pitch,
+            swap_yz=self._swap_yz,
+            lock_rotation=self.lock_rotation,
+            horizon_lock=self._horizon_lock,
+            camera_mode=self._camera_mode,
+            cursor_pivot=self._cursor_pivot_enabled,
+        )
+
     def _apply_sensitivity(self) -> None:
         """Recompute the three scale fields from base values × current level multiplier."""
         m = self._SENSITIVITY_MULTIPLIERS[self._sensitivity_level - 1]
@@ -1059,6 +1004,7 @@ class Controller:
         """Step to the next sensitivity level (wraps 5 → 1) and update display."""
         self._sensitivity_level = (self._sensitivity_level % 5) + 1
         self._apply_sensitivity()
+        self._persist_state()
         logging.warning(
             "Sensitivity level %d/%d  (×%.2f)",
             self._sensitivity_level,
@@ -1077,6 +1023,7 @@ class Controller:
     async def _action_toggle_camera_mode(self) -> None:
         """Toggle between object mode (model moves) and camera mode (fly/orbit)."""
         self._camera_mode = not self._camera_mode
+        self._persist_state()
         label = "CAMERA" if self._camera_mode else "OBJECT"
         logging.warning("Motion mode: %s", label)
         loop = asyncio.get_running_loop()
@@ -1087,6 +1034,7 @@ class Controller:
     async def _action_toggle_cursor_pivot(self) -> None:
         """Toggle cursor-based rotation pivot on/off."""
         self._cursor_pivot_enabled = not self._cursor_pivot_enabled
+        self._persist_state()
         label = "CPIV ON" if self._cursor_pivot_enabled else "CPIV OFF"
         logging.warning("Cursor pivot: %s", label)
         loop = asyncio.get_running_loop()
@@ -1158,7 +1106,12 @@ class Controller:
         U, _, Vt = np.linalg.svd(R_cam)
         R_cam = U @ Vt
 
-        pitch = 0.0 if self.lock_rotation else event.pitch
+        # Apply axis toggles before anything else.
+        ev_y = event.z if self._swap_yz else event.y   # zoom axis
+        ev_z = event.y if self._swap_yz else event.z   # vertical pan axis
+        pitch_raw = -event.pitch if self._invert_pitch else event.pitch
+
+        pitch = 0.0 if self.lock_rotation else pitch_raw
         yaw = 0.0 if self.lock_rotation else event.yaw
         roll = 0.0 if (self.lock_rotation or self._horizon_lock) else event.roll
 
@@ -1247,7 +1200,7 @@ class Controller:
         _PAN_RATE = 3.0 / 350.0 * self._translation_scale  # view-spans per second per max-count (matches PR #5)
         cam_trans = (
             np.array(
-                [-event.x * span_x * cam_sign, -event.z * span_y * cam_sign, event.y * depth / 6.0],
+                [-event.x * span_x * cam_sign, -ev_z * span_y * cam_sign, ev_y * depth / 6.0],
                 dtype=np.float64,
             )
             * _PAN_RATE
@@ -1262,7 +1215,7 @@ class Controller:
             # Zoom: Onshape's base-2 law (scale = 2^(-delta/6)); center-preserving.
             # Only XY extents scale — near/far (indices 2 & 5) are left unchanged.
             _ZOOM_RATE = 20.0 / np.log(2.0) / 350.0 * self._zoom_scale
-            zoom_scale = 2.0 ** (-event.y * _ZOOM_RATE / 6.0)
+            zoom_scale = 2.0 ** (-ev_y * _ZOOM_RATE / 6.0)
             cx = (extents[0] + extents[3]) * 0.5
             cy = (extents[1] + extents[4]) * 0.5
             hx = (extents[3] - extents[0]) * 0.5 * zoom_scale

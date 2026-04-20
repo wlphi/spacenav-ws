@@ -8,6 +8,7 @@ would produce wrong camera motion in Onshape without any obvious error.
 import math
 
 import numpy as np
+import pytest
 
 from spacenav_ws.controller import (
     CursorPivotResult,
@@ -337,3 +338,145 @@ class TestViewMatrices:
         M = np.array(get_view_matrix("front")).reshape(4, 4)
         look = -M[2, :3]
         assert look[1] > 0.9, f"front view should look toward +Y, got look={look}"
+
+    def test_all_views_have_zero_translation(self):
+        """Base view matrices must have zero translation (centering is applied at runtime)."""
+        for name, flat in VIEW_MATRICES.items():
+            M = np.array(flat).reshape(4, 4)
+            np.testing.assert_allclose(
+                M[3, :3], [0.0, 0.0, 0.0], atol=1e-12,
+                err_msg=f"{name}: base matrix should have zero translation",
+            )
+
+    @pytest.mark.parametrize("name,expected_look", [
+        ("top",    ( 0,  0, -1)),
+        ("bottom", ( 0,  0,  1)),
+        ("front",  ( 0,  1,  0)),
+        ("back",   ( 0, -1,  0)),
+        ("right",  (-1,  0,  0)),
+        ("left",   ( 1,  0,  0)),
+    ])
+    def test_axis_aligned_look_directions(self, name, expected_look):
+        """Each axis-aligned view must look exactly along its expected world axis."""
+        M = np.array(get_view_matrix(name)).reshape(4, 4)
+        look = -M[2, :3]          # cam_z = M[2,:3], look direction = -cam_z
+        np.testing.assert_allclose(look, expected_look, atol=1e-10,
+                                   err_msg=f"{name}: unexpected look direction")
+
+    def test_iso_views_look_toward_origin(self):
+        """ISO views must have all three look-direction components non-zero."""
+        for name in ("iso1", "iso2"):
+            M = np.array(get_view_matrix(name)).reshape(4, 4)
+            look = -M[2, :3]
+            assert all(abs(c) > 0.1 for c in look), \
+                f"{name}: expected diagonal look direction, got {look}"
+
+    def test_up_direction_is_z_for_ortho_views(self):
+        """For all non-top/bottom views the camera Y axis (up in image) must be +Z world."""
+        for name in ("front", "back", "left", "right"):
+            M = np.array(get_view_matrix(name)).reshape(4, 4)
+            cam_y = M[1, :3]   # camera up direction in world space
+            np.testing.assert_allclose(cam_y, [0.0, 0.0, 1.0], atol=1e-10,
+                                       err_msg=f"{name}: camera up should be +Z")
+
+
+# ===========================================================================
+# _action_set_view centering math
+# ===========================================================================
+
+
+class TestViewCentering:
+    """Verify the centering formula used in _action_set_view.
+
+    Contract: given model extents [mn, mx] and a view rotation R, the
+    translation T = -(centre @ R) must map the model centre to the
+    camera-space origin.  This is purely algebraic — no I/O required.
+    """
+
+    def _centred_affine(self, view_name: str, mn, mx) -> np.ndarray:
+        A = np.array(get_view_matrix(view_name), dtype=np.float64).reshape(4, 4)
+        R = A[:3, :3]
+        centre = (np.asarray(mn) + np.asarray(mx)) / 2.0
+        A[3, :3] = -(centre @ R)
+        return A
+
+    @pytest.mark.parametrize("view_name", list(VIEW_MATRICES))
+    def test_model_centre_maps_to_camera_origin(self, view_name):
+        """After centering, model centre must land at (0, 0, 0) in camera space."""
+        mn = np.array([1.0, 2.0, 3.0])
+        mx = np.array([5.0, 6.0, 7.0])
+        A = self._centred_affine(view_name, mn, mx)
+        R, T = A[:3, :3], A[3, :3]
+        centre = (mn + mx) / 2.0
+        centre_cam = centre @ R + T
+        np.testing.assert_allclose(centre_cam, [0.0, 0.0, 0.0], atol=1e-12,
+                                   err_msg=f"{view_name}: centre not at camera origin")
+
+    @pytest.mark.parametrize("view_name", list(VIEW_MATRICES))
+    def test_model_corners_are_symmetric_in_camera_space(self, view_name):
+        """After centering, the 8 model corners must be symmetric about the
+        camera-space origin (i.e. the bounding box is centred at zero)."""
+        mn = np.array([1.0, 2.0, 3.0])
+        mx = np.array([5.0, 8.0, 11.0])
+        A = self._centred_affine(view_name, mn, mx)
+        R, T = A[:3, :3], A[3, :3]
+        # All 8 corners of the AABB
+        corners = np.array([[x, y, z]
+                             for x in (mn[0], mx[0])
+                             for y in (mn[1], mx[1])
+                             for z in (mn[2], mx[2])], dtype=np.float64)
+        cam = corners @ R + T
+        cam_centre = cam.mean(axis=0)
+        np.testing.assert_allclose(cam_centre, [0.0, 0.0, 0.0], atol=1e-12,
+                                   err_msg=f"{view_name}: corners not symmetric")
+
+    def test_centering_does_not_alter_rotation(self):
+        """Centering must only modify the translation row, not the rotation."""
+        for name in VIEW_MATRICES:
+            base = np.array(get_view_matrix(name), dtype=np.float64).reshape(4, 4)
+            centred = self._centred_affine(name, [0, 0, 0], [4, 4, 4])
+            np.testing.assert_array_equal(base[:3, :3], centred[:3, :3])
+
+    def test_centering_with_origin_centred_model(self):
+        """Model centred at world origin → T must be zero for all views."""
+        mn = np.array([-2.0, -3.0, -1.0])
+        mx = np.array([ 2.0,  3.0,  1.0])
+        for name in VIEW_MATRICES:
+            A = self._centred_affine(name, mn, mx)
+            np.testing.assert_allclose(A[3, :3], [0.0, 0.0, 0.0], atol=1e-12,
+                                       err_msg=f"{name}: origin-centred model should give T=0")
+
+    @pytest.mark.parametrize("offset", [
+        np.array([  100.0,    0.0,    0.0]),   # far along +X
+        np.array([ -500.0, -300.0, -200.0]),   # deep negative quadrant
+        np.array([1000.0,  2000.0, 3000.0]),   # very large positive offset
+        np.array([  0.001,   0.001,  0.001]),  # tiny near-origin offset
+    ])
+    def test_centering_works_for_off_origin_model(self, offset):
+        """model.extents can describe a bounding box anywhere in world space.
+        The centering formula must work correctly regardless of position."""
+        half = np.array([1.0, 2.0, 0.5])
+        mn = offset - half
+        mx = offset + half
+        expected_centre = offset          # (mn + mx) / 2
+
+        for name in VIEW_MATRICES:
+            A = self._centred_affine(name, mn, mx)
+            R, T = A[:3, :3], A[3, :3]
+            # Model centre must land at camera-space origin
+            centre_cam = expected_centre @ R + T
+            np.testing.assert_allclose(
+                centre_cam, [0.0, 0.0, 0.0], atol=1e-10,
+                err_msg=f"{name}: off-origin model centre not at camera origin"
+            )
+            # Centroid of all 8 corners must also be at camera-space origin
+            corners = np.array([[mn[0]+dx*(mx[0]-mn[0]),
+                                  mn[1]+dy*(mx[1]-mn[1]),
+                                  mn[2]+dz*(mx[2]-mn[2])]
+                                 for dx in (0, 1) for dy in (0, 1) for dz in (0, 1)],
+                                dtype=np.float64)
+            cam = corners @ R + T
+            np.testing.assert_allclose(
+                cam.mean(axis=0), [0.0, 0.0, 0.0], atol=1e-10,
+                err_msg=f"{name}: corner centroid not at camera origin for offset {offset}"
+            )
