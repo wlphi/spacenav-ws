@@ -473,7 +473,14 @@ class Controller:
     async def start_mouse_event_stream(self):
         logging.info("Starting the mouse stream")
         while True:
-            mouse_event = await self.reader.read(32)
+            try:
+                mouse_event = await self.reader.readexactly(32)
+            except asyncio.IncompleteReadError:
+                # spacenavd closed the socket (e.g. it was restarted). Stop the
+                # stream so the session ends and the client reconnects with a
+                # fresh socket, instead of spinning on EOF forever.
+                logging.warning("spacenavd connection closed — ending mouse stream")
+                return
             if not (self.focus and self.subscribed):
                 continue
             # Drain any queued events so we only process the most recent one.
@@ -481,11 +488,17 @@ class Controller:
             # raises TimeoutError if the queue is empty — no private API needed.
             try:
                 tail = await asyncio.wait_for(self.reader.read(32 * 64), timeout=0)
+                # Complete a trailing partial event so the stream stays aligned.
+                if len(tail) % 32:
+                    tail += await self.reader.readexactly(32 - len(tail) % 32)
                 combined = mouse_event + tail
                 n = len(combined) // 32
                 mouse_event = combined[(n - 1) * 32 : n * 32]
             except asyncio.TimeoutError:
                 pass
+            except asyncio.IncompleteReadError:
+                logging.warning("spacenavd connection closed — ending mouse stream")
+                return
             nums = struct.unpack("iiiiiiii", mouse_event)
             event = from_message(list(nums))
             try:

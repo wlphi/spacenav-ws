@@ -131,17 +131,32 @@ async def nlproxy(ws: WebSocket):
     """This is the websocket that webapplications should connect to for mouse data"""
     global _active_controller
     wamp_session = WampSession(ws)
-    spacenav_reader, _ = await get_async_spacenav_socket_reader()
+    spacenav_reader, spacenav_writer = await get_async_spacenav_socket_reader()
     ctrl = await create_mouse_controller(wamp_session, spacenav_reader)
     _active_controller = ctrl
     if _cursor_ws_count > 0:
         ctrl._cursor_active = True
+    tasks = [
+        asyncio.create_task(ctrl.start_mouse_event_stream(), name="mouse"),
+        asyncio.create_task(ctrl.wamp_state_handler.start_wamp_message_stream(), name="wamp"),
+    ]
     try:
-        # TODO, better error handling then just dropping the websocket disconnect on the floor?
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(ctrl.start_mouse_event_stream(), name="mouse")
-            tg.create_task(ctrl.wamp_state_handler.start_wamp_message_stream(), name="wamp")
+        # When either side goes away (browser tab closed, or spacenavd restarted)
+        # tear down the other too, so stale sessions don't linger holding a
+        # spacenavd socket.
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            if not t.cancelled() and t.exception() is not None:
+                logging.error("Session task %s failed", t.get_name(), exc_info=t.exception())
     finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        spacenav_writer.close()
+        try:
+            await ws.close()
+        except Exception:
+            pass  # already closed by the client
         if _active_controller is ctrl:
             _active_controller = None
 
